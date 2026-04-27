@@ -1,0 +1,41 @@
+# IDE
+.idea/
+.vs/
+
+# CMake and build output
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+
+# Visual Studio / MSVC artifacts
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+*.pdb
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.cache
+
