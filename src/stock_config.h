@@ -32,6 +32,7 @@ struct StockTarget {
 struct AppConfig {
     unsigned int sample_interval_seconds{2};
     double usd_hkd_rate{7.84};
+    std::wstring alpaca_endpoint{L"https://data.alpaca.markets"};
     std::wstring alpaca_key_id;
     std::wstring alpaca_secret_key;
     std::wstring alpaca_feed{L"iex"};

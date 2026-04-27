@@ -270,7 +270,13 @@ AppConfig LoadOrCreateConfig() {
         if (auto rate = ReadDoubleValue(*settings, "usd_hkd_rate")) {
             config.usd_hkd_rate = *rate;
         }
-        config.alpaca_key_id = Utf8ToWide(ReadStringValue(*settings, "alpaca_key_id").value_or(""));
+        config.alpaca_endpoint =
+            Utf8ToWide(ReadStringValue(*settings, "alpaca_endpoint")
+                           .value_or(ReadStringValue(*settings, "endpoint")
+                                         .value_or("https://data.alpaca.markets")));
+        config.alpaca_key_id =
+            Utf8ToWide(ReadStringValue(*settings, "alpaca_key")
+                           .value_or(ReadStringValue(*settings, "alpaca_key_id").value_or("")));
         config.alpaca_secret_key =
             Utf8ToWide(ReadStringValue(*settings, "alpaca_secret_key").value_or(""));
         config.alpaca_feed = Utf8ToWide(ReadStringValue(*settings, "alpaca_feed").value_or("iex"));
@@ -350,7 +356,8 @@ bool SaveConfig(const AppConfig& config) {
     output << "  \"_settings\": {\n";
     output << "    \"sample_interval_seconds\": " << config.sample_interval_seconds << ",\n";
     output << "    \"usd_hkd_rate\": " << config.usd_hkd_rate << ",\n";
-    output << "    \"alpaca_key_id\": \"" << WideToUtf8(config.alpaca_key_id) << "\",\n";
+    output << "    \"alpaca_endpoint\": \"" << WideToUtf8(config.alpaca_endpoint) << "\",\n";
+    output << "    \"alpaca_key\": \"" << WideToUtf8(config.alpaca_key_id) << "\",\n";
     output << "    \"alpaca_secret_key\": \"" << WideToUtf8(config.alpaca_secret_key) << "\",\n";
     output << "    \"alpaca_feed\": \"" << WideToUtf8(config.alpaca_feed) << "\",\n";
     output << "    \"popup_activation_mode\": \""

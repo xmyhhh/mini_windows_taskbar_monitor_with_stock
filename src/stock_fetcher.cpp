@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 namespace stock_taskbar_monitor {
@@ -61,6 +62,43 @@ std::wstring Utf8ToWide(const std::string& value) {
     MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(),
                         needed);
     return result;
+}
+
+struct HttpEndpoint {
+    std::wstring host;
+    std::wstring path_prefix;
+    bool https{true};
+};
+
+HttpEndpoint ParseHttpEndpoint(std::wstring endpoint, const std::wstring& fallback_host) {
+    if (endpoint.empty()) {
+        endpoint = L"https://" + fallback_host;
+    }
+
+    HttpEndpoint parsed;
+    constexpr std::wstring_view https_prefix = L"https://";
+    constexpr std::wstring_view http_prefix = L"http://";
+    if (endpoint.starts_with(https_prefix)) {
+        endpoint.erase(0, https_prefix.size());
+        parsed.https = true;
+    } else if (endpoint.starts_with(http_prefix)) {
+        endpoint.erase(0, http_prefix.size());
+        parsed.https = false;
+    }
+
+    const size_t slash = endpoint.find(L'/');
+    parsed.host = slash == std::wstring::npos ? endpoint : endpoint.substr(0, slash);
+    parsed.path_prefix = slash == std::wstring::npos ? L"" : endpoint.substr(slash);
+    while (!parsed.path_prefix.empty() && parsed.path_prefix.back() == L'/') {
+        parsed.path_prefix.pop_back();
+    }
+    if (parsed.path_prefix == L"/v2") {
+        parsed.path_prefix.clear();
+    }
+    if (parsed.host.empty()) {
+        parsed.host = fallback_host;
+    }
+    return parsed;
 }
 
 std::optional<std::string> HttpGet(const std::wstring& host,
@@ -333,13 +371,15 @@ std::optional<PriceQuote> FetchAlpacaPrice(const StockTarget& target, const AppC
     }
 
     const std::wstring feed = !target.alpaca_feed.empty() ? target.alpaca_feed : config.alpaca_feed;
-    const std::wstring path = L"/v2/stocks/" + target.code + L"/snapshot?feed=" + feed;
+    const HttpEndpoint endpoint = ParseHttpEndpoint(config.alpaca_endpoint, L"data.alpaca.markets");
+    const std::wstring path =
+        endpoint.path_prefix + L"/v2/stocks/" + target.code + L"/snapshot?feed=" + feed;
     const std::wstring headers =
         L"APCA-API-KEY-ID: " + config.alpaca_key_id + L"\r\n" +
         L"APCA-API-SECRET-KEY: " + config.alpaca_secret_key + L"\r\n" +
         L"User-Agent: stock_taskbar_monitor/1.0\r\n";
 
-    auto response = HttpGet(L"data.alpaca.markets", path, true, headers);
+    auto response = HttpGet(endpoint.host, path, endpoint.https, headers);
     if (!response) {
         return std::nullopt;
     }

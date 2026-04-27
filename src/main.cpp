@@ -2,6 +2,7 @@
 #include "process_monitor.h"
 #include "resource.h"
 #include "stock_config.h"
+#include "stock_config_dialog.h"
 #include "stock_fetcher.h"
 #include "system_metrics.h"
 #include "taskbar_embedder.h"
@@ -20,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <set>
 #include <vector>
 
 namespace minimal_taskbar_monitor {
@@ -37,6 +39,7 @@ constexpr int kToggleModeHotkeyId = 1;
 constexpr UINT kLayoutIntervalMs = 1000;
 constexpr UINT kReattachDelayMs = 600;
 constexpr UINT kHoverHideDelayMs = 180;
+constexpr ULONGLONG kStockNotificationStartupSilenceMs = 10000;
 constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kExitCommandId = 1001;
@@ -66,6 +69,7 @@ constexpr UINT kStockSortGainersCommandId = 1024;
 constexpr UINT kStockSortLosersCommandId = 1025;
 constexpr UINT kLanguageEnglishCommandId = 1026;
 constexpr UINT kLanguageChineseCommandId = 1027;
+constexpr UINT kOpenStockConfigDialogCommandId = 1028;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -788,6 +792,25 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &notify_icon);
     }
 
+    void ShowTrayBalloon(const std::wstring& title, const std::wstring& message) {
+        if (!tray_icon_added_ && !EnsureTrayIcon()) {
+            return;
+        }
+        if (GetTickCount64() - app_start_tick_ms_ < kStockNotificationStartupSilenceMs) {
+            return;
+        }
+
+        NOTIFYICONDATAW notify_icon{};
+        notify_icon.cbSize = sizeof(notify_icon);
+        notify_icon.hWnd = controller_window_;
+        notify_icon.uID = kTrayIconId;
+        notify_icon.uFlags = NIF_INFO;
+        notify_icon.dwInfoFlags = NIIF_WARNING | NIIF_NOSOUND;
+        wcsncpy_s(notify_icon.szInfoTitle, title.c_str(), _TRUNCATE);
+        wcsncpy_s(notify_icon.szInfo, message.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &notify_icon);
+    }
+
     void RemoveTrayIcon() {
         if (!tray_icon_added_) {
             return;
@@ -1002,6 +1025,32 @@ private:
         has_second_line_ = !line2_text_.empty();
     }
 
+    void EvaluateStockPriceNotification(const stock_taskbar_monitor::StockTarget& target,
+                                        double price) {
+        std::wstring alert_key;
+        std::wstring message;
+        if (target.min_price && price < *target.min_price) {
+            alert_key = target.symbol + L":below";
+            message = target.symbol + L" " + FormatPriceValue(price) +
+                      Text(L" is below ", L" 低于 ") + FormatPriceValue(*target.min_price);
+        } else if (target.max_price && price > *target.max_price) {
+            alert_key = target.symbol + L":above";
+            message = target.symbol + L" " + FormatPriceValue(price) +
+                      Text(L" is above ", L" 高于 ") + FormatPriceValue(*target.max_price);
+        } else {
+            stock_active_alerts_.erase(target.symbol + L":below");
+            stock_active_alerts_.erase(target.symbol + L":above");
+            return;
+        }
+
+        if (GetTickCount64() - app_start_tick_ms_ < kStockNotificationStartupSilenceMs) {
+            return;
+        }
+        if (stock_active_alerts_.insert(alert_key).second) {
+            ShowTrayBalloon(Text(L"Stock Price Alert", L"股票价格提醒"), message);
+        }
+    }
+
     void SampleStocks() {
         stock_rows_.clear();
         for (const auto& target : stock_config_.stocks) {
@@ -1017,6 +1066,7 @@ private:
             }
 
             row.price = quote->price;
+            EvaluateStockPriceNotification(target, quote->price);
             row.change_percent = quote->change_percent;
             row.taskbar_price_text = FormatPriceValue(quote->price);
             row.price_text = row.taskbar_price_text;
@@ -2568,6 +2618,7 @@ private:
 
     void ReloadStockConfig() {
         stock_config_ = stock_taskbar_monitor::LoadOrCreateConfig();
+        stock_active_alerts_.clear();
         if (stock_mode_) {
             SampleStocks();
             RefreshFontAndSize();
@@ -2575,6 +2626,28 @@ private:
             if (hover_popup_visible_) {
                 PositionHoverPopup();
                 RequestHoverPopupRedraw();
+            }
+        }
+    }
+
+    void ShowStockConfigDialog() {
+        if (!stock_taskbar_monitor::ShowStockConfigDialog(controller_window_,
+                                                          instance_handle_,
+                                                          IsChinese(),
+                                                          &stock_config_)) {
+            return;
+        }
+        stock_active_alerts_.clear();
+        if (stock_mode_) {
+            SampleStocks();
+            RefreshFontAndSize();
+            RequestWidgetRedraw();
+            if (hover_popup_visible_) {
+                PositionHoverPopup();
+                RequestHoverPopupRedraw();
+            }
+            if (embedder_.IsAttached()) {
+                embedder_.RefreshLayout(widget_window_, widget_size_);
             }
         }
     }
@@ -3194,6 +3267,8 @@ private:
                     Text(L"Show stock monitor", L"显示股票监视器"));
         AppendMenuW(stock_menu, MF_STRING, kReloadStockConfigCommandId,
                     Text(L"Reload Stock Config", L"重载股票配置"));
+        AppendMenuW(stock_menu, MF_STRING, kOpenStockConfigDialogCommandId,
+                    Text(L"Configure Stocks...", L"配置股票..."));
         AppendMenuW(stock_menu,
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(stock_symbol_count_menu),
@@ -3248,6 +3323,10 @@ private:
         }
         if (command == kReloadStockConfigCommandId) {
             ReloadStockConfig();
+            return;
+        }
+        if (command == kOpenStockConfigDialogCommandId) {
+            ShowStockConfigDialog();
             return;
         }
         if (command == kStockSymbols2CommandId) {
@@ -3784,6 +3863,7 @@ private:
     HICON tray_icon_handle_{nullptr};
     ULONG_PTR gdiplus_token_{0};
     bool gdiplus_started_{false};
+    ULONGLONG app_start_tick_ms_{GetTickCount64()};
     AppConfig app_config_{};
     bool stock_mode_{false};
     stock_taskbar_monitor::AppConfig stock_config_{};
@@ -3797,6 +3877,7 @@ private:
     std::wstring line2_text_{L"\u2191 0bps  \u2193 0bps  R 0B/s  W 0B/s"};
     std::wstring stock_last_update_time_{L"--:--:--"};
     std::vector<StockRow> stock_rows_{};
+    std::set<std::wstring> stock_active_alerts_{};
     std::vector<DisplayLines::Column> display_columns_{};
     std::vector<int> column_widths_{};
     ProcessMonitor process_monitor_{};

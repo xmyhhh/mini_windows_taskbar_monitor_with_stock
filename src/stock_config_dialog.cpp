@@ -1,0 +1,722 @@
+#include "stock_config_dialog.h"
+
+#include <windowsx.h>
+
+#include <algorithm>
+#include <cwchar>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace stock_taskbar_monitor {
+namespace {
+
+constexpr wchar_t kDialogClassName[] = L"StockTaskbarConfigDialog";
+
+enum ControlId {
+    kEndpointEditId = 7101,
+    kKeyEditId = 7102,
+    kSecretEditId = 7103,
+    kFeedEditId = 7104,
+    kStockListId = 7110,
+    kSymbolEditId = 7111,
+    kCodeEditId = 7112,
+    kMarketComboId = 7113,
+    kShowUsdCheckId = 7114,
+    kAddStockButtonId = 7115,
+    kRemoveStockButtonId = 7116,
+    kMinPriceEditId = 7117,
+    kMaxPriceEditId = 7118,
+    kMinPriceEnableId = 7119,
+    kMaxPriceEnableId = 7120,
+    kSaveButtonId = 7201,
+    kCancelButtonId = 7202,
+};
+
+struct DialogState {
+    HWND window{};
+    HWND endpoint{};
+    HWND key{};
+    HWND secret{};
+    HWND feed{};
+    HWND stock_list{};
+    HWND symbol{};
+    HWND code{};
+    HWND market{};
+    HWND show_usd{};
+    HWND min_price_enabled{};
+    HWND min_price{};
+    HWND max_price_enabled{};
+    HWND max_price{};
+    HWND add_stock{};
+    HWND remove_stock{};
+    HWND save{};
+    HWND cancel{};
+    HFONT font{};
+    bool chinese{};
+    bool saved{};
+    bool syncing{};
+    bool editor_has_invalid_number{};
+    int selected_stock{-1};
+    AppConfig* config{};
+    std::vector<StockTarget> stocks;
+};
+
+const wchar_t* Text(bool chinese, const wchar_t* english, const wchar_t* chinese_text) {
+    return chinese ? chinese_text : english;
+}
+
+int Scale(HWND window, int value) {
+    const UINT dpi = GetDpiForWindow(window);
+    return MulDiv(value, static_cast<int>(dpi == 0 ? 96 : dpi), 96);
+}
+
+HWND CreateLabel(DialogState& state, const wchar_t* text, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(0,
+                                   L"STATIC",
+                                   text,
+                                   WS_CHILD | WS_VISIBLE,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateEdit(DialogState& state, int id, int x, int y, int w, int h, DWORD extra_style = 0) {
+    HWND control = CreateWindowExW(WS_EX_CLIENTEDGE,
+                                   L"EDIT",
+                                   L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra_style,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateButton(DialogState& state, int id, const wchar_t* text, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(0,
+                                   L"BUTTON",
+                                   text,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateCheckBox(DialogState& state, int id, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(0,
+                                   L"BUTTON",
+                                   L"USD",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateCheckBox(DialogState& state,
+                    int id,
+                    const wchar_t* text,
+                    int x,
+                    int y,
+                    int w,
+                    int h) {
+    HWND control = CreateWindowExW(0,
+                                   L"BUTTON",
+                                   text,
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateListBox(DialogState& state, int id, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(WS_EX_CLIENTEDGE,
+                                   L"LISTBOX",
+                                   L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                       LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    return control;
+}
+
+HWND CreateMarketCombo(DialogState& state, int id, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(0,
+                                   L"COMBOBOX",
+                                   L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                       WS_VSCROLL,
+                                   Scale(state.window, x),
+                                   Scale(state.window, y),
+                                   Scale(state.window, w),
+                                   Scale(state.window, h),
+                                   state.window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   nullptr,
+                                   nullptr);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
+    ComboBox_AddString(control, L"hk");
+    ComboBox_AddString(control, L"cn");
+    ComboBox_AddString(control, L"us");
+    ComboBox_SetCurSel(control, 0);
+    return control;
+}
+
+std::wstring GetWindowString(HWND control) {
+    const int length = GetWindowTextLengthW(control);
+    std::wstring value(static_cast<size_t>(std::max(length, 0) + 1), L'\0');
+    if (length > 0) {
+        GetWindowTextW(control, value.data(), length + 1);
+    }
+    value.resize(static_cast<size_t>(std::max(length, 0)));
+    return value;
+}
+
+void SetWindowString(HWND control, const std::wstring& value) {
+    SetWindowTextW(control, value.c_str());
+}
+
+std::wstring GetComboText(HWND combo) {
+    const int index = ComboBox_GetCurSel(combo);
+    if (index < 0) {
+        return L"hk";
+    }
+    wchar_t buffer[16]{};
+    ComboBox_GetLBText(combo, index, buffer);
+    return buffer;
+}
+
+std::wstring FormatOptionalDouble(std::optional<double> value) {
+    if (!value) {
+        return L"";
+    }
+    wchar_t buffer[64]{};
+    swprintf_s(buffer, L"%.4f", *value);
+    std::wstring text = buffer;
+    while (!text.empty() && text.back() == L'0') {
+        text.pop_back();
+    }
+    if (!text.empty() && text.back() == L'.') {
+        text.pop_back();
+    }
+    return text;
+}
+
+std::optional<double> ParseOptionalDouble(const std::wstring& text, bool* ok) {
+    if (ok != nullptr) {
+        *ok = true;
+    }
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    wchar_t* end = nullptr;
+    const double value = wcstod(text.c_str(), &end);
+    if (end == text.c_str() || (end != nullptr && *end != L'\0')) {
+        if (ok != nullptr) {
+            *ok = false;
+        }
+        return std::nullopt;
+    }
+    return value;
+}
+
+void SelectMarket(HWND combo, const std::wstring& market) {
+    const int count = ComboBox_GetCount(combo);
+    for (int i = 0; i < count; ++i) {
+        wchar_t buffer[16]{};
+        ComboBox_GetLBText(combo, i, buffer);
+        if (_wcsicmp(buffer, market.c_str()) == 0) {
+            ComboBox_SetCurSel(combo, i);
+            return;
+        }
+    }
+    ComboBox_SetCurSel(combo, 0);
+}
+
+std::wstring StockListLabel(const StockTarget& stock) {
+    std::wstring label = stock.symbol;
+    label += L"    ";
+    label += stock.code;
+    label += L"    ";
+    label += stock.market;
+    return label;
+}
+
+void RefreshStockList(DialogState& state) {
+    state.syncing = true;
+    ListBox_ResetContent(state.stock_list);
+    for (const auto& stock : state.stocks) {
+        const std::wstring label = StockListLabel(stock);
+        ListBox_AddString(state.stock_list, label.c_str());
+    }
+    if (!state.stocks.empty()) {
+        state.selected_stock = std::clamp(state.selected_stock, 0, static_cast<int>(state.stocks.size()) - 1);
+        ListBox_SetCurSel(state.stock_list, state.selected_stock);
+    } else {
+        state.selected_stock = -1;
+    }
+    state.syncing = false;
+}
+
+void LoadSelectedStockToEditor(DialogState& state) {
+    state.syncing = true;
+    if (state.selected_stock < 0 ||
+        state.selected_stock >= static_cast<int>(state.stocks.size())) {
+        SetWindowString(state.symbol, L"");
+        SetWindowString(state.code, L"");
+        SelectMarket(state.market, L"hk");
+        Button_SetCheck(state.show_usd, BST_UNCHECKED);
+        Button_SetCheck(state.min_price_enabled, BST_UNCHECKED);
+        SetWindowString(state.min_price, L"");
+        EnableWindow(state.min_price, FALSE);
+        Button_SetCheck(state.max_price_enabled, BST_UNCHECKED);
+        SetWindowString(state.max_price, L"");
+        EnableWindow(state.max_price, FALSE);
+        EnableWindow(state.remove_stock, FALSE);
+        state.syncing = false;
+        return;
+    }
+
+    const StockTarget& stock = state.stocks[static_cast<size_t>(state.selected_stock)];
+    SetWindowString(state.symbol, stock.symbol);
+    SetWindowString(state.code, stock.code);
+    SelectMarket(state.market, stock.market);
+    Button_SetCheck(state.show_usd, stock.show_usd ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(state.min_price_enabled, stock.min_price ? BST_CHECKED : BST_UNCHECKED);
+    SetWindowString(state.min_price, FormatOptionalDouble(stock.min_price));
+    EnableWindow(state.min_price, stock.min_price ? TRUE : FALSE);
+    Button_SetCheck(state.max_price_enabled, stock.max_price ? BST_CHECKED : BST_UNCHECKED);
+    SetWindowString(state.max_price, FormatOptionalDouble(stock.max_price));
+    EnableWindow(state.max_price, stock.max_price ? TRUE : FALSE);
+    EnableWindow(state.remove_stock, TRUE);
+    state.syncing = false;
+}
+
+void CommitEditorToSelectedStock(DialogState& state) {
+    if (state.syncing || state.selected_stock < 0 ||
+        state.selected_stock >= static_cast<int>(state.stocks.size())) {
+        return;
+    }
+    StockTarget& stock = state.stocks[static_cast<size_t>(state.selected_stock)];
+    stock.symbol = GetWindowString(state.symbol);
+    stock.code = GetWindowString(state.code);
+    stock.market = GetComboText(state.market);
+    stock.show_usd = Button_GetCheck(state.show_usd) == BST_CHECKED;
+    stock.source = _wcsicmp(stock.market.c_str(), L"us") == 0 ? L"alpaca" : L"";
+    bool min_ok = true;
+    bool max_ok = true;
+    stock.min_price = Button_GetCheck(state.min_price_enabled) == BST_CHECKED
+                          ? ParseOptionalDouble(GetWindowString(state.min_price), &min_ok)
+                          : std::nullopt;
+    stock.max_price = Button_GetCheck(state.max_price_enabled) == BST_CHECKED
+                          ? ParseOptionalDouble(GetWindowString(state.max_price), &max_ok)
+                          : std::nullopt;
+    state.editor_has_invalid_number = !min_ok || !max_ok;
+    const int keep_selection = state.selected_stock;
+    RefreshStockList(state);
+    state.selected_stock = keep_selection;
+    ListBox_SetCurSel(state.stock_list, state.selected_stock);
+}
+
+void SelectStock(DialogState& state, int index) {
+    CommitEditorToSelectedStock(state);
+    state.selected_stock = index;
+    ListBox_SetCurSel(state.stock_list, state.selected_stock);
+    LoadSelectedStockToEditor(state);
+}
+
+void AddStock(DialogState& state) {
+    CommitEditorToSelectedStock(state);
+    StockTarget stock;
+    stock.symbol = Text(state.chinese, L"NEW", L"NEW");
+    stock.code = L"";
+    stock.market = L"hk";
+    state.stocks.push_back(stock);
+    state.selected_stock = static_cast<int>(state.stocks.size()) - 1;
+    RefreshStockList(state);
+    LoadSelectedStockToEditor(state);
+    SetFocus(state.symbol);
+    SendMessageW(state.symbol, EM_SETSEL, 0, -1);
+}
+
+void RemoveSelectedStock(DialogState& state) {
+    if (state.selected_stock < 0 ||
+        state.selected_stock >= static_cast<int>(state.stocks.size())) {
+        return;
+    }
+    state.stocks.erase(state.stocks.begin() + state.selected_stock);
+    if (state.selected_stock >= static_cast<int>(state.stocks.size())) {
+        state.selected_stock = static_cast<int>(state.stocks.size()) - 1;
+    }
+    RefreshStockList(state);
+    LoadSelectedStockToEditor(state);
+}
+
+void PopulateControls(DialogState& state) {
+    SetWindowString(state.endpoint, state.config->alpaca_endpoint);
+    SetWindowString(state.key, state.config->alpaca_key_id);
+    SetWindowString(state.secret, state.config->alpaca_secret_key);
+    SetWindowString(state.feed, state.config->alpaca_feed);
+    state.stocks = state.config->stocks;
+    state.selected_stock = state.stocks.empty() ? -1 : 0;
+    RefreshStockList(state);
+    LoadSelectedStockToEditor(state);
+}
+
+bool ValidateStocks(DialogState& state) {
+    if (state.editor_has_invalid_number) {
+        MessageBoxW(state.window,
+                    Text(state.chinese,
+                         L"Low Alert and High Alert must be numbers when enabled.",
+                         L"启用后，低价提醒和高价提醒必须填写数字。"),
+                    Text(state.chinese, L"Stock Config", L"股票配置"),
+                    MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    for (size_t i = 0; i < state.stocks.size(); ++i) {
+        const StockTarget& stock = state.stocks[i];
+        if (stock.symbol.empty() || stock.code.empty()) {
+            state.selected_stock = static_cast<int>(i);
+            RefreshStockList(state);
+            LoadSelectedStockToEditor(state);
+            MessageBoxW(state.window,
+                        Text(state.chinese,
+                             L"Each stock needs both Name and Code.",
+                             L"每个股票都需要同时填写名称和代码。"),
+                        Text(state.chinese, L"Stock Config", L"股票配置"),
+                        MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        if (stock.min_price && stock.max_price && *stock.min_price >= *stock.max_price) {
+            state.selected_stock = static_cast<int>(i);
+            RefreshStockList(state);
+            LoadSelectedStockToEditor(state);
+            MessageBoxW(state.window,
+                        Text(state.chinese,
+                             L"Min Price must be lower than Max Price.",
+                             L"最低价必须小于最高价。"),
+                        Text(state.chinese, L"Stock Config", L"股票配置"),
+                        MB_OK | MB_ICONWARNING);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SaveControls(DialogState& state) {
+    AppConfig next = *state.config;
+    next.alpaca_endpoint = GetWindowString(state.endpoint);
+    next.alpaca_key_id = GetWindowString(state.key);
+    next.alpaca_secret_key = GetWindowString(state.secret);
+    next.alpaca_feed = GetWindowString(state.feed);
+    if (next.alpaca_endpoint.empty()) {
+        next.alpaca_endpoint = L"https://data.alpaca.markets";
+    }
+    if (next.alpaca_feed.empty()) {
+        next.alpaca_feed = L"iex";
+    }
+
+    CommitEditorToSelectedStock(state);
+    if (state.stocks.empty()) {
+        MessageBoxW(state.window,
+                    Text(state.chinese,
+                         L"Keep at least one stock row.",
+                         L"至少保留一行股票。"),
+                    Text(state.chinese, L"Stock Config", L"股票配置"),
+                    MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    if (!ValidateStocks(state)) {
+        return false;
+    }
+
+    next.stocks = state.stocks;
+    if (!SaveConfig(next)) {
+        MessageBoxW(state.window,
+                    Text(state.chinese,
+                         L"Unable to save stocks_config.json.",
+                         L"无法保存 stocks_config.json。"),
+                    Text(state.chinese, L"Stock Config", L"股票配置"),
+                    MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    *state.config = std::move(next);
+    state.saved = true;
+    DestroyWindow(state.window);
+    return true;
+}
+
+void CreateDialogControls(DialogState& state) {
+    const int font_height = -Scale(state.window, 14);
+    state.font = CreateFontW(font_height,
+                             0,
+                             0,
+                             0,
+                             FW_NORMAL,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_SWISS,
+                             L"Segoe UI");
+
+    CreateLabel(state, Text(state.chinese, L"Alpaca API Keys", L"Alpaca API Keys"), 18, 16, 220, 22);
+    CreateLabel(state, L"Endpoint", 18, 50, 86, 22);
+    state.endpoint = CreateEdit(state, kEndpointEditId, 112, 48, 390, 24);
+    CreateLabel(state, L"Key ID", 18, 82, 86, 22);
+    state.key = CreateEdit(state, kKeyEditId, 112, 80, 390, 24);
+    CreateLabel(state, L"Secret Key", 18, 114, 86, 22);
+    state.secret = CreateEdit(state, kSecretEditId, 112, 112, 390, 24, ES_PASSWORD);
+    CreateLabel(state, L"Feed", 18, 146, 86, 22);
+    state.feed = CreateEdit(state, kFeedEditId, 112, 144, 90, 24);
+
+    CreateLabel(state, Text(state.chinese, L"Stocks", L"股票"), 18, 184, 90, 22);
+    state.stock_list = CreateListBox(state, kStockListId, 18, 212, 220, 250);
+    state.add_stock = CreateButton(state,
+                                   kAddStockButtonId,
+                                   Text(state.chinese, L"Add", L"添加"),
+                                   18,
+                                   472,
+                                   104,
+                                   28);
+    state.remove_stock = CreateButton(state,
+                                      kRemoveStockButtonId,
+                                      Text(state.chinese, L"Remove", L"删除"),
+                                      134,
+                                      472,
+                                      104,
+                                      28);
+
+    CreateLabel(state, Text(state.chinese, L"Selected Stock", L"当前股票"), 270, 212, 160, 22);
+    CreateLabel(state, Text(state.chinese, L"Name", L"名称"), 270, 248, 90, 20);
+    state.symbol = CreateEdit(state, kSymbolEditId, 370, 246, 132, 24);
+    CreateLabel(state, Text(state.chinese, L"Code", L"代码"), 270, 288, 90, 20);
+    state.code = CreateEdit(state, kCodeEditId, 370, 286, 132, 24);
+    CreateLabel(state, Text(state.chinese, L"Market", L"市场"), 270, 328, 90, 20);
+    state.market = CreateMarketCombo(state, kMarketComboId, 370, 326, 132, 160);
+    CreateLabel(state, Text(state.chinese, L"Display", L"显示"), 270, 368, 90, 20);
+    state.show_usd = CreateCheckBox(state, kShowUsdCheckId, 370, 366, 90, 24);
+    state.min_price_enabled = CreateCheckBox(state, kMinPriceEnableId, L"", 270, 408, 26, 24);
+    CreateLabel(state, Text(state.chinese, L"Low Alert", L"低价提醒"), 300, 408, 90, 20);
+    state.min_price = CreateEdit(state, kMinPriceEditId, 400, 406, 102, 24);
+    state.max_price_enabled = CreateCheckBox(state, kMaxPriceEnableId, L"", 270, 448, 26, 24);
+    CreateLabel(state, Text(state.chinese, L"High Alert", L"高价提醒"), 300, 448, 90, 20);
+    state.max_price = CreateEdit(state, kMaxPriceEditId, 400, 446, 102, 24);
+
+    state.save = CreateButton(state,
+                              kSaveButtonId,
+                              Text(state.chinese, L"Save", L"保存"),
+                              312,
+                              520,
+                              90,
+                              30);
+    state.cancel = CreateButton(state,
+                                kCancelButtonId,
+                                Text(state.chinese, L"Cancel", L"取消"),
+                                412,
+                                520,
+                                90,
+                                30);
+    PopulateControls(state);
+}
+
+LRESULT CALLBACK DialogProc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
+    DialogState* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_NCCREATE: {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(l_param);
+        state = static_cast<DialogState*>(create->lpCreateParams);
+        state->window = window;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+    case WM_CREATE:
+        CreateDialogControls(*state);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(w_param) == kStockListId && HIWORD(w_param) == LBN_SELCHANGE) {
+            const int selected = ListBox_GetCurSel(state->stock_list);
+            SelectStock(*state, selected);
+            return 0;
+        }
+        if (LOWORD(w_param) == kAddStockButtonId) {
+            AddStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kRemoveStockButtonId) {
+            RemoveSelectedStock(*state);
+            return 0;
+        }
+        if ((LOWORD(w_param) == kSymbolEditId || LOWORD(w_param) == kCodeEditId ||
+             LOWORD(w_param) == kMinPriceEditId || LOWORD(w_param) == kMaxPriceEditId) &&
+            HIWORD(w_param) == EN_CHANGE) {
+            CommitEditorToSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kMarketComboId && HIWORD(w_param) == CBN_SELCHANGE) {
+            CommitEditorToSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kShowUsdCheckId) {
+            CommitEditorToSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kMinPriceEnableId) {
+            const bool enabled = Button_GetCheck(state->min_price_enabled) == BST_CHECKED;
+            EnableWindow(state->min_price, enabled ? TRUE : FALSE);
+            if (!enabled) {
+                SetWindowString(state->min_price, L"");
+            }
+            CommitEditorToSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kMaxPriceEnableId) {
+            const bool enabled = Button_GetCheck(state->max_price_enabled) == BST_CHECKED;
+            EnableWindow(state->max_price, enabled ? TRUE : FALSE);
+            if (!enabled) {
+                SetWindowString(state->max_price, L"");
+            }
+            CommitEditorToSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kSaveButtonId) {
+            SaveControls(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kCancelButtonId) {
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY:
+        if (state != nullptr && state->font != nullptr) {
+            DeleteObject(state->font);
+            state->font = nullptr;
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void CenterOverOwner(HWND window, HWND owner, int width, int height) {
+    RECT owner_rect{};
+    if (owner != nullptr && IsWindow(owner)) {
+        GetWindowRect(owner, &owner_rect);
+    } else {
+        owner_rect = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    }
+    const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
+    const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
+    SetWindowPos(window, nullptr, std::max(0, x), std::max(0, y), 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+}
+
+}  // namespace
+
+bool ShowStockConfigDialog(HWND owner,
+                           HINSTANCE instance_handle,
+                           bool chinese,
+                           AppConfig* config) {
+    if (config == nullptr) {
+        return false;
+    }
+
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.lpfnWndProc = DialogProc;
+    window_class.hInstance = instance_handle;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    window_class.lpszClassName = kDialogClassName;
+    RegisterClassExW(&window_class);
+
+    DialogState state;
+    state.chinese = chinese;
+    state.config = config;
+
+    const int width = Scale(owner, 540);
+    const int height = Scale(owner, 590);
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME,
+                                  kDialogClassName,
+                                  Text(chinese, L"Stock Config", L"股票配置"),
+                                  WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                                  CW_USEDEFAULT,
+                                  CW_USEDEFAULT,
+                                  width,
+                                  height,
+                                  owner,
+                                  nullptr,
+                                  instance_handle,
+                                  &state);
+    if (window == nullptr) {
+        return false;
+    }
+
+    CenterOverOwner(window, owner, width, height);
+    EnableWindow(owner, FALSE);
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+
+    MSG message{};
+    while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    return state.saved;
+}
+
+}  // namespace stock_taskbar_monitor

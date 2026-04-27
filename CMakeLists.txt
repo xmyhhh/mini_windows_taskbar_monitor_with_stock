@@ -37,6 +37,7 @@ add_executable(stock_taskbar_monitor WIN32
     "${CMAKE_CURRENT_BINARY_DIR}/app_generated.rc"
     src/app_config.cpp
     src/main.cpp
+    src/stock_config_dialog.cpp
     src/stock_fetcher.cpp
     src/stock_config.cpp
     src/process_monitor.cpp

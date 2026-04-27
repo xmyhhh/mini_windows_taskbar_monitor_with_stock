@@ -115,7 +115,8 @@ stocks_config.json
   "_settings": {
     "sample_interval_seconds": 2,
     "usd_hkd_rate": 7.84,
-    "alpaca_key_id": "",
+    "alpaca_endpoint": "https://data.alpaca.markets",
+    "alpaca_key": "",
     "alpaca_secret_key": "",
     "alpaca_feed": "iex",
     "popup_activation_mode": "hover",
@@ -147,7 +148,8 @@ stocks_config.json
 
 - `sample_interval_seconds`：股票刷新间隔，范围会限制在 1 到 60 秒
 - `usd_hkd_rate`：港币到美元折算汇率，用于港股 ADR 风格美元价格显示
-- `alpaca_key_id`：Alpaca API Key ID
+- `alpaca_endpoint`：Alpaca Market Data endpoint，默认 `https://data.alpaca.markets`
+- `alpaca_key`：Alpaca API Key ID
 - `alpaca_secret_key`：Alpaca Secret Key
 - `alpaca_feed`：默认 Alpaca feed，免费账户通常用 `iex`
 - `popup_activation_mode`：弹窗模式，`hover` 或 `click`
@@ -228,7 +230,8 @@ stocks_config.json
 在 `stocks_config.json` 的 `_settings` 中填写：
 
 ```json
-"alpaca_key_id": "你的 key id",
+"alpaca_endpoint": "https://data.alpaca.markets",
+"alpaca_key": "你的 key id",
 "alpaca_secret_key": "你的 secret key",
 "alpaca_feed": "iex"
 ```
@@ -241,7 +244,8 @@ stocks_config.json
 
 如果美股显示 `(null)`，优先检查：
 
-- `alpaca_key_id` 是否正确
+- `alpaca_endpoint` 是否正确。行情接口默认用 `https://data.alpaca.markets`，不是 paper trading 的 `https://paper-api.alpaca.markets/v2`
+- `alpaca_key` 是否正确
 - `alpaca_secret_key` 是否正确
 - `alpaca_feed` 是否有权限
 - ticker 是否拼写正确
