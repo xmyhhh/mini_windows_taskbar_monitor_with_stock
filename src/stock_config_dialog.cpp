@@ -12,6 +12,7 @@ namespace stock_taskbar_monitor {
 namespace {
 
 constexpr wchar_t kDialogClassName[] = L"StockTaskbarConfigDialog";
+constexpr const wchar_t* kAlpacaFeeds[] = {L"sip", L"iex", L"delayed_sip", L"boats", L"overnight"};
 
 enum ControlId {
     kEndpointEditId = 7101,
@@ -254,6 +255,16 @@ std::wstring GetComboText(HWND combo) {
     return buffer;
 }
 
+std::wstring GetComboText(HWND combo, const wchar_t* fallback) {
+    const int index = ComboBox_GetCurSel(combo);
+    if (index < 0) {
+        return fallback;
+    }
+    wchar_t buffer[32]{};
+    ComboBox_GetLBText(combo, index, buffer);
+    return buffer;
+}
+
 std::wstring FormatOptionalDouble(std::optional<double> value) {
     if (!value) {
         return L"";
@@ -299,6 +310,26 @@ void SelectMarket(HWND combo, const std::wstring& market) {
         }
     }
     ComboBox_SetCurSel(combo, 0);
+}
+
+void PopulateAlpacaFeedCombo(HWND combo) {
+    for (const wchar_t* feed : kAlpacaFeeds) {
+        ComboBox_AddString(combo, feed);
+    }
+    ComboBox_SetCurSel(combo, 1);
+}
+
+void SelectAlpacaFeed(HWND combo, const std::wstring& feed) {
+    const int count = ComboBox_GetCount(combo);
+    for (int i = 0; i < count; ++i) {
+        wchar_t buffer[32]{};
+        ComboBox_GetLBText(combo, i, buffer);
+        if (_wcsicmp(buffer, feed.c_str()) == 0) {
+            ComboBox_SetCurSel(combo, i);
+            return;
+        }
+    }
+    ComboBox_SetCurSel(combo, 1);
 }
 
 std::wstring StockListLabel(const StockTarget& stock) {
@@ -536,7 +567,7 @@ void PopulateControls(DialogState& state) {
     SetWindowString(state.endpoint, state.config->alpaca_endpoint);
     SetWindowString(state.key, state.config->alpaca_key_id);
     SetWindowString(state.secret, state.config->alpaca_secret_key);
-    SetWindowString(state.feed, state.config->alpaca_feed);
+    SelectAlpacaFeed(state.feed, state.config->alpaca_feed);
 
     state.groups = state.config->stock_groups;
     if (state.groups.size() > kMaxStockGroups) {
@@ -690,7 +721,7 @@ bool SaveControls(DialogState& state) {
     next.alpaca_endpoint = GetWindowString(state.endpoint);
     next.alpaca_key_id = GetWindowString(state.key);
     next.alpaca_secret_key = GetWindowString(state.secret);
-    next.alpaca_feed = GetWindowString(state.feed);
+    next.alpaca_feed = GetComboText(state.feed, L"iex");
     if (next.alpaca_endpoint.empty()) {
         next.alpaca_endpoint = L"https://data.alpaca.markets";
     }
@@ -751,7 +782,8 @@ void CreateDialogControls(DialogState& state) {
     CreateLabel(state, L"Secret Key", 18, 114, 86, 22);
     state.secret = CreateEdit(state, kSecretEditId, 112, 112, 390, 24, ES_PASSWORD);
     CreateLabel(state, L"Feed", 18, 146, 86, 22);
-    state.feed = CreateEdit(state, kFeedEditId, 112, 144, 90, 24);
+    state.feed = CreateComboBox(state, kFeedEditId, 112, 144, 120, 160);
+    PopulateAlpacaFeedCombo(state.feed);
 
     CreateLabel(state, Text(state.chinese, L"Watchlist", L"自选列表"), 18, 184, 90, 22);
     state.group_combo = CreateComboBox(state, kGroupComboId, 112, 182, 126, 160);

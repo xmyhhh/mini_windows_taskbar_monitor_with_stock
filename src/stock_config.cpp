@@ -40,6 +40,24 @@ std::string WideToUtf8(const std::wstring& value) {
     return result;
 }
 
+std::wstring ToLower(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), towlower);
+    return value;
+}
+
+bool IsSupportedAlpacaFeed(std::wstring_view feed) {
+    return feed == L"sip" || feed == L"iex" || feed == L"delayed_sip" || feed == L"boats" ||
+           feed == L"overnight";
+}
+
+std::wstring NormalizeAlpacaFeed(const std::wstring& feed) {
+    const std::wstring normalized = ToLower(feed);
+    if (IsSupportedAlpacaFeed(normalized)) {
+        return normalized;
+    }
+    return L"iex";
+}
+
 std::wstring GetExecutableDirectory() {
     std::wstring path(MAX_PATH, L'\0');
     DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -219,7 +237,9 @@ StockTarget ParseStockTarget(const std::string& symbol_key, const std::string& o
     target.code = Utf8ToWide(ReadStringValue(object, "code").value_or(""));
     target.market = Utf8ToWide(ReadStringValue(object, "market").value_or("hk"));
     target.source = Utf8ToWide(ReadStringValue(object, "source").value_or(""));
-    target.alpaca_feed = Utf8ToWide(ReadStringValue(object, "alpaca_feed").value_or(""));
+    const std::wstring alpaca_feed =
+        Utf8ToWide(ReadStringValue(object, "alpaca_feed").value_or(""));
+    target.alpaca_feed = alpaca_feed.empty() ? L"" : NormalizeAlpacaFeed(alpaca_feed);
     target.adr_factor = ReadDoubleValue(object, "adr_factor").value_or(1.0);
     target.show_usd = ReadBoolValue(object, "show_usd").value_or(false);
     target.min_price = ReadDoubleValue(object, "min_price");
@@ -428,7 +448,8 @@ AppConfig LoadOrCreateConfig() {
                            .value_or(ReadStringValue(*settings, "alpaca_key_id").value_or("")));
         config.alpaca_secret_key =
             Utf8ToWide(ReadStringValue(*settings, "alpaca_secret_key").value_or(""));
-        config.alpaca_feed = Utf8ToWide(ReadStringValue(*settings, "alpaca_feed").value_or("iex"));
+        config.alpaca_feed =
+            NormalizeAlpacaFeed(Utf8ToWide(ReadStringValue(*settings, "alpaca_feed").value_or("iex")));
         config.popup_activation_mode = ParsePopupActivationMode(
             ReadStringValue(*settings, "popup_activation_mode").value_or("hover"));
         config.sort_mode =
@@ -471,6 +492,7 @@ bool SaveConfig(const AppConfig& config) {
     if (normalized.stock_groups.empty()) {
         AssignDefaultGroups(normalized);
     }
+    normalized.alpaca_feed = NormalizeAlpacaFeed(normalized.alpaca_feed);
     TrimStockGroups(normalized);
     if (normalized.active_group.empty()) {
         normalized.active_group = normalized.stock_groups.front().name;
@@ -525,6 +547,9 @@ bool SaveConfig(const AppConfig& config) {
             if (stock.symbol.empty() || stock.code.empty()) {
                 continue;
             }
+            const std::wstring stock_alpaca_feed = stock.alpaca_feed.empty()
+                                                       ? L""
+                                                       : NormalizeAlpacaFeed(stock.alpaca_feed);
             output << (first_stock ? "\n" : ",\n");
             first_stock = false;
             output << "      \"" << WideToUtf8(stock.symbol) << "\": {\n";
@@ -533,8 +558,8 @@ bool SaveConfig(const AppConfig& config) {
             if (!stock.source.empty()) {
                 output << "        \"source\": \"" << WideToUtf8(stock.source) << "\",\n";
             }
-            if (!stock.alpaca_feed.empty()) {
-                output << "        \"alpaca_feed\": \"" << WideToUtf8(stock.alpaca_feed) << "\",\n";
+            if (!stock_alpaca_feed.empty()) {
+                output << "        \"alpaca_feed\": \"" << WideToUtf8(stock_alpaca_feed) << "\",\n";
             }
             output << "        \"adr_factor\": " << stock.adr_factor << ",\n";
             output << "        \"show_usd\": " << (stock.show_usd ? "true" : "false");
