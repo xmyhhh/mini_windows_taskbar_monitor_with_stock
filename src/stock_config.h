@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace stock_taskbar_monitor {
+
+inline constexpr size_t kMaxStockGroups = 6;
 
 enum class PopupActivationMode {
     kHover,
@@ -29,6 +32,11 @@ struct StockTarget {
     std::optional<double> max_price;
 };
 
+struct StockGroup {
+    std::wstring name;
+    std::vector<StockTarget> stocks;
+};
+
 struct AppConfig {
     unsigned int sample_interval_seconds{2};
     double usd_hkd_rate{7.84};
@@ -39,6 +47,8 @@ struct AppConfig {
     PopupActivationMode popup_activation_mode{PopupActivationMode::kHover};
     unsigned int taskbar_symbol_count{4};
     StockSortMode sort_mode{StockSortMode::kConfigOrder};
+    std::wstring active_group;
+    std::vector<StockGroup> stock_groups;
     std::vector<StockTarget> stocks;
 };
 

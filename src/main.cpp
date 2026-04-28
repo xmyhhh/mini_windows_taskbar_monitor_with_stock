@@ -18,10 +18,12 @@
 #include <cwctype>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace minimal_taskbar_monitor {
@@ -31,15 +33,24 @@ namespace {
 constexpr wchar_t kControllerClassName[] = L"MinimalTaskbarMonitorControllerWindow";
 constexpr wchar_t kWidgetClassName[] = L"MinimalTaskbarMonitorWidgetWindow";
 constexpr wchar_t kHoverPopupClassName[] = L"MinimalTaskbarMonitorHoverPopupWindow";
+constexpr wchar_t kHelpDialogClassName[] = L"MinimalTaskbarMonitorHelpWindow";
+constexpr wchar_t kProjectUrl[] =
+    L"https://github.com/xmyhhh/mini_windows_taskbar_monitor_with_stock";
 constexpr UINT_PTR kSampleTimerId = 1;
 constexpr UINT_PTR kLayoutTimerId = 2;
 constexpr UINT_PTR kReattachTimerId = 3;
 constexpr UINT_PTR kHoverHideTimerId = 4;
+constexpr UINT_PTR kDeferredStockSampleTimerId = 5;
+constexpr UINT_PTR kDeferredStockConfigSaveTimerId = 6;
 constexpr int kToggleModeHotkeyId = 1;
 constexpr UINT kLayoutIntervalMs = 1000;
 constexpr UINT kReattachDelayMs = 600;
 constexpr UINT kHoverHideDelayMs = 180;
+constexpr UINT kDeferredStockSampleDelayMs = 250;
+constexpr UINT kDeferredStockConfigSaveDelayMs = 500;
 constexpr ULONGLONG kStockNotificationStartupSilenceMs = 10000;
+constexpr ULONGLONG kStockNotificationSwitchSilenceMs = 2500;
+constexpr int kStockPopupVisibleRows = 10;
 constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kExitCommandId = 1001;
@@ -70,6 +81,10 @@ constexpr UINT kStockSortLosersCommandId = 1025;
 constexpr UINT kLanguageEnglishCommandId = 1026;
 constexpr UINT kLanguageChineseCommandId = 1027;
 constexpr UINT kOpenStockConfigDialogCommandId = 1028;
+constexpr UINT kHelpUrlEditId = 7001;
+constexpr UINT kHelpBodyEditId = 7002;
+constexpr UINT kHelpOpenProjectButtonId = 7003;
+constexpr UINT kHelpCloseButtonId = 7004;
 constexpr UINT kMetricCpuCommandId = 1101;
 constexpr UINT kMetricMemoryCommandId = 1102;
 constexpr UINT kMetricUploadCommandId = 1103;
@@ -115,6 +130,25 @@ struct HoverPopupPalette {
     COLORREF search_border;
     COLORREF search_active_border;
     COLORREF search_placeholder;
+};
+
+struct HelpDialogState {
+    HWND owner{};
+    HWND window{};
+    HWND title_label{};
+    HWND project_label_window{};
+    HWND url_edit{};
+    HWND body_edit{};
+    HWND open_button{};
+    HWND close_button{};
+    HFONT title_font{};
+    HFONT body_font{};
+    std::wstring title;
+    std::wstring project_url;
+    std::wstring body;
+    std::wstring project_label;
+    std::wstring open_label;
+    std::wstring close_label;
 };
 
 enum class HoverPopupSortMode {
@@ -615,6 +649,7 @@ struct StockRow {
     std::wstring price_text;
     std::wstring taskbar_price_text;
     std::wstring market;
+    std::wstring code;
     double price{0.0};
     std::optional<double> change_percent;
 };
@@ -826,10 +861,13 @@ private:
 
     void Shutdown() {
         is_shutting_down_ = true;
+        FlushDeferredStockConfigSave();
         KillTimer(controller_window_, kSampleTimerId);
         KillTimer(controller_window_, kLayoutTimerId);
         KillTimer(controller_window_, kReattachTimerId);
         KillTimer(controller_window_, kHoverHideTimerId);
+        KillTimer(controller_window_, kDeferredStockSampleTimerId);
+        KillTimer(controller_window_, kDeferredStockConfigSaveTimerId);
         UnregisterHotKey(controller_window_, kToggleModeHotkeyId);
         HideHoverPopup();
         RemoveTrayIcon();
@@ -890,6 +928,28 @@ private:
         RequestWidgetRedraw();
     }
 
+    std::pair<std::wstring, std::wstring> BuildReservedStockTaskbarLines() const {
+        std::wstring first;
+        std::wstring second;
+        if (stock_config_.stocks.empty()) {
+            return {first, second};
+        }
+
+        const size_t max_symbols =
+            std::min<size_t>(stock_config_.stocks.size(),
+                             static_cast<size_t>(stock_config_.taskbar_symbol_count));
+        const size_t first_line_count =
+            std::min<size_t>(max_symbols, max_symbols <= 2 ? max_symbols : max_symbols / 2);
+        for (size_t i = 0; i < max_symbols; ++i) {
+            std::wstring& target_line = i < first_line_count ? first : second;
+            if (!target_line.empty()) {
+                target_line += L"  ";
+            }
+            target_line += stock_config_.stocks[i].symbol + L" 00000.00";
+        }
+        return {first, second};
+    }
+
     void RefreshFontAndSize() {
         const UINT dpi = embedder_.CurrentDpi();
         if (dpi != current_dpi_ || font_ == nullptr || popup_font_ == nullptr ||
@@ -943,6 +1003,9 @@ private:
             SelectObject(screen_dc, active_font);
             const SIZE line1_size = MeasureText(screen_dc, line1_text_);
             const SIZE line2_size = MeasureText(screen_dc, line2_text_);
+            const auto reserved_lines = BuildReservedStockTaskbarLines();
+            const SIZE reserved_line1_size = MeasureText(screen_dc, reserved_lines.first);
+            const SIZE reserved_line2_size = MeasureText(screen_dc, reserved_lines.second);
             SelectObject(screen_dc, old_font);
             ReleaseDC(nullptr, screen_dc);
 
@@ -953,7 +1016,10 @@ private:
             const int vertical_padding = ScaleByDpi(current_dpi_, 5);
             const int line_gap = ScaleByDpi(current_dpi_, 2);
             const bool has_second_line = !line2_text_.empty();
-            const int content_width = std::max<int>(line1_size.cx, line2_size.cx);
+            int content_width = std::max<int>(static_cast<int>(line1_size.cx),
+                                              static_cast<int>(line2_size.cx));
+            content_width = std::max<int>(content_width, static_cast<int>(reserved_line1_size.cx));
+            content_width = std::max<int>(content_width, static_cast<int>(reserved_line2_size.cx));
             widget_size_.cx =
                 std::max<int>(ScaleByDpi(current_dpi_, 140), content_width + horizontal_padding * 2);
             widget_size_.cy =
@@ -1025,29 +1091,82 @@ private:
         has_second_line_ = !line2_text_.empty();
     }
 
-    void EvaluateStockPriceNotification(const stock_taskbar_monitor::StockTarget& target,
-                                        double price) {
-        std::wstring alert_key;
-        std::wstring message;
-        if (target.min_price && price < *target.min_price) {
-            alert_key = target.symbol + L":below";
-            message = target.symbol + L" " + FormatPriceValue(price) +
-                      Text(L" is below ", L" 低于 ") + FormatPriceValue(*target.min_price);
-        } else if (target.max_price && price > *target.max_price) {
-            alert_key = target.symbol + L":above";
-            message = target.symbol + L" " + FormatPriceValue(price) +
-                      Text(L" is above ", L" 高于 ") + FormatPriceValue(*target.max_price);
-        } else {
-            stock_active_alerts_.erase(target.symbol + L":below");
-            stock_active_alerts_.erase(target.symbol + L":above");
+    const stock_taskbar_monitor::StockGroup* FindStockGroupByName(const std::wstring& name) const {
+        const auto group_it =
+            std::find_if(stock_config_.stock_groups.begin(),
+                         stock_config_.stock_groups.end(),
+                         [&name](const stock_taskbar_monitor::StockGroup& group) {
+                             return _wcsicmp(group.name.c_str(), name.c_str()) == 0;
+                         });
+        return group_it == stock_config_.stock_groups.end() ? nullptr : &(*group_it);
+    }
+
+    std::vector<StockRow> BuildPlaceholderStockRows(
+        const std::vector<stock_taskbar_monitor::StockTarget>& targets) const {
+        std::vector<StockRow> rows;
+        rows.reserve(targets.size());
+        for (const auto& target : targets) {
+            StockRow row;
+            row.symbol = target.symbol;
+            row.market = target.market;
+            row.code = target.code;
+            row.taskbar_price_text = L"...";
+            row.price_text = row.taskbar_price_text;
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+
+    void LoadCachedStockRowsForActiveGroup() {
+        const auto cache_it = stock_group_rows_cache_.find(stock_config_.active_group);
+        if (cache_it != stock_group_rows_cache_.end() && !cache_it->second.empty()) {
+            stock_rows_ = cache_it->second;
+            UpdateStockDisplayLines();
             return;
         }
 
-        if (GetTickCount64() - app_start_tick_ms_ < kStockNotificationStartupSilenceMs) {
+        stock_rows_ = BuildPlaceholderStockRows(stock_config_.stocks);
+        UpdateStockDisplayLines();
+    }
+
+    bool ShouldSilenceStockNotification() const {
+        const ULONGLONG now = GetTickCount64();
+        if (now - app_start_tick_ms_ < kStockNotificationStartupSilenceMs) {
+            return true;
+        }
+        return now < stock_notification_silenced_until_ms_;
+    }
+
+    void SilenceStockNotificationsForSwitch() {
+        const ULONGLONG until = GetTickCount64() + kStockNotificationSwitchSilenceMs;
+        if (until > stock_notification_silenced_until_ms_) {
+            stock_notification_silenced_until_ms_ = until;
+        }
+    }
+
+    void EvaluateStockPriceNotification(const stock_taskbar_monitor::StockTarget& target,
+                                        double price) {
+        const std::wstring symbol_key = target.market + L":" + target.code;
+        std::wstring alert_key;
+        std::wstring message;
+        if (target.min_price && price < *target.min_price) {
+            alert_key = symbol_key + L":below";
+            message = target.symbol + L" " + FormatPriceValue(price) +
+                      Text(L" is below ", L" 低于 ") + FormatPriceValue(*target.min_price);
+        } else if (target.max_price && price > *target.max_price) {
+            alert_key = symbol_key + L":above";
+            message = target.symbol + L" " + FormatPriceValue(price) +
+                      Text(L" is above ", L" 高于 ") + FormatPriceValue(*target.max_price);
+        } else {
+            stock_active_alerts_.erase(symbol_key + L":below");
+            stock_active_alerts_.erase(symbol_key + L":above");
             return;
         }
+
         if (stock_active_alerts_.insert(alert_key).second) {
-            ShowTrayBalloon(Text(L"Stock Price Alert", L"股票价格提醒"), message);
+            if (!ShouldSilenceStockNotification()) {
+                ShowTrayBalloon(Text(L"Stock Price Alert", L"股票价格提醒"), message);
+            }
         }
     }
 
@@ -1057,6 +1176,7 @@ private:
             StockRow row;
             row.symbol = target.symbol;
             row.market = target.market;
+            row.code = target.code;
             const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
             if (!quote) {
                 row.price_text = L"(null)";
@@ -1079,8 +1199,221 @@ private:
             stock_rows_.push_back(row);
         }
         SortStockRows();
+        stock_group_rows_cache_[stock_config_.active_group] = stock_rows_;
         stock_last_update_time_ = FormatClockTime();
+        stock_group_last_update_time_[stock_config_.active_group] = stock_last_update_time_;
+        if (_wcsicmp(PopupStockGroupName().c_str(), stock_config_.active_group.c_str()) == 0) {
+            popup_stock_rows_ = stock_rows_;
+        }
         UpdateStockDisplayLines();
+    }
+
+    void ResetPopupStockGroupToTaskbarGroup() {
+        popup_stock_group_ = stock_config_.active_group;
+        popup_stock_rows_ = stock_rows_;
+        hover_popup_scroll_offset_ = 0;
+    }
+
+    void LoadPopupStockRowsFromCacheOrPlaceholder(const std::wstring& group_name) {
+        popup_stock_group_ = group_name;
+        const auto cache_it = stock_group_rows_cache_.find(group_name);
+        if (cache_it != stock_group_rows_cache_.end() && !cache_it->second.empty()) {
+            popup_stock_rows_ = cache_it->second;
+            return;
+        }
+
+        const auto* group = FindStockGroupByName(group_name);
+        popup_stock_rows_ = group != nullptr ? BuildPlaceholderStockRows(group->stocks)
+                                             : std::vector<StockRow>{};
+    }
+
+    void SamplePopupStocksForGroup(const std::wstring& group_name) {
+        const auto* group = FindStockGroupByName(group_name);
+        if (group == nullptr) {
+            popup_stock_rows_.clear();
+            return;
+        }
+
+        std::vector<StockRow> rows;
+        rows.reserve(group->stocks.size());
+        for (const auto& target : group->stocks) {
+            StockRow row;
+            row.symbol = target.symbol;
+            row.market = target.market;
+            row.code = target.code;
+            const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
+            if (!quote) {
+                row.price_text = L"(null)";
+                row.taskbar_price_text = row.price_text;
+                rows.push_back(std::move(row));
+                continue;
+            }
+
+            row.price = quote->price;
+            row.change_percent = quote->change_percent;
+            row.taskbar_price_text = FormatPriceValue(quote->price);
+            row.price_text = row.taskbar_price_text;
+            if (target.show_usd && _wcsicmp(target.market.c_str(), L"hk") == 0 &&
+                stock_config_.usd_hkd_rate > 0.0) {
+                row.price_text += L"/" +
+                                  FormatPriceValue((quote->price / stock_config_.usd_hkd_rate) *
+                                                   target.adr_factor);
+            }
+            rows.push_back(std::move(row));
+        }
+        SortStockRows(rows);
+        popup_stock_rows_ = rows;
+        stock_group_rows_cache_[group_name] = popup_stock_rows_;
+        stock_group_last_update_time_[group_name] = FormatClockTime();
+    }
+
+    void SetPopupStockGroupIndex(int index) {
+        const int group_count = static_cast<int>(stock_config_.stock_groups.size());
+        if (group_count <= 0) {
+            return;
+        }
+        index = (index % group_count + group_count) % group_count;
+        const auto& group = stock_config_.stock_groups[static_cast<size_t>(index)];
+        if (_wcsicmp(PopupStockGroupName().c_str(), group.name.c_str()) == 0) {
+            return;
+        }
+
+        hover_popup_scroll_offset_ = 0;
+        LoadPopupStockRowsFromCacheOrPlaceholder(group.name);
+        UpdateHoverPopupScrollBar();
+        RequestHoverPopupRedraw();
+        SamplePopupStocksForGroup(group.name);
+        UpdateHoverPopupScrollBar();
+        RequestHoverPopupRedraw();
+    }
+
+    int ActiveStockGroupIndex() const {
+        for (size_t index = 0; index < stock_config_.stock_groups.size(); ++index) {
+            if (_wcsicmp(stock_config_.stock_groups[index].name.c_str(),
+                         stock_config_.active_group.c_str()) == 0) {
+                return static_cast<int>(index);
+            }
+        }
+        return stock_config_.stock_groups.empty() ? -1 : 0;
+    }
+
+    std::wstring ActiveStockGroupName() const {
+        const int index = ActiveStockGroupIndex();
+        if (index >= 0 && index < static_cast<int>(stock_config_.stock_groups.size())) {
+            return stock_config_.stock_groups[static_cast<size_t>(index)].name;
+        }
+        return Text(L"Default", L"默认");
+    }
+
+    int PopupStockGroupIndex() const {
+        if (popup_stock_group_.empty()) {
+            return ActiveStockGroupIndex();
+        }
+        for (size_t index = 0; index < stock_config_.stock_groups.size(); ++index) {
+            if (_wcsicmp(stock_config_.stock_groups[index].name.c_str(),
+                         popup_stock_group_.c_str()) == 0) {
+                return static_cast<int>(index);
+            }
+        }
+        return ActiveStockGroupIndex();
+    }
+
+    std::wstring PopupStockGroupName() const {
+        const int index = PopupStockGroupIndex();
+        if (index >= 0 && index < static_cast<int>(stock_config_.stock_groups.size())) {
+            return stock_config_.stock_groups[static_cast<size_t>(index)].name;
+        }
+        return ActiveStockGroupName();
+    }
+
+    std::wstring PopupStockLastUpdateTime() const {
+        const auto group_name = PopupStockGroupName();
+        const auto update_it = stock_group_last_update_time_.find(group_name);
+        if (update_it != stock_group_last_update_time_.end()) {
+            return update_it->second;
+        }
+        if (_wcsicmp(group_name.c_str(), stock_config_.active_group.c_str()) == 0) {
+            return stock_last_update_time_;
+        }
+        return L"--:--:--";
+    }
+
+    void ScheduleDeferredStockConfigSave() {
+        stock_config_save_pending_ = true;
+        if (controller_window_ == nullptr || !IsWindow(controller_window_)) {
+            SaveStockConfigImmediate();
+            stock_config_save_pending_ = false;
+            return;
+        }
+        KillTimer(controller_window_, kDeferredStockConfigSaveTimerId);
+        SetTimer(controller_window_,
+                 kDeferredStockConfigSaveTimerId,
+                 kDeferredStockConfigSaveDelayMs,
+                 nullptr);
+    }
+
+    void CancelDeferredStockConfigSave() {
+        if (controller_window_ != nullptr && IsWindow(controller_window_)) {
+            KillTimer(controller_window_, kDeferredStockConfigSaveTimerId);
+        }
+        stock_config_save_pending_ = false;
+    }
+
+    bool SaveStockConfigImmediate() {
+        if (controller_window_ != nullptr && IsWindow(controller_window_)) {
+            KillTimer(controller_window_, kDeferredStockConfigSaveTimerId);
+        }
+        stock_config_save_pending_ = false;
+        return stock_taskbar_monitor::SaveConfig(stock_config_);
+    }
+
+    void FlushDeferredStockConfigSave() {
+        if (!stock_config_save_pending_) {
+            return;
+        }
+        SaveStockConfigImmediate();
+    }
+
+    void SetActiveStockGroupIndex(int index) {
+        const int group_count = static_cast<int>(stock_config_.stock_groups.size());
+        if (group_count <= 0) {
+            return;
+        }
+        index = (index % group_count + group_count) % group_count;
+        const auto& group = stock_config_.stock_groups[static_cast<size_t>(index)];
+        if (_wcsicmp(stock_config_.active_group.c_str(), group.name.c_str()) == 0) {
+            return;
+        }
+
+        stock_config_.active_group = group.name;
+        stock_config_.stocks = group.stocks;
+        ScheduleDeferredStockConfigSave();
+
+        if (stock_mode_) {
+            SetTimer(controller_window_,
+                     kSampleTimerId,
+                     std::max(1u, stock_config_.sample_interval_seconds) * 1000u,
+                     nullptr);
+            KillTimer(controller_window_, kDeferredStockSampleTimerId);
+            LoadCachedStockRowsForActiveGroup();
+            RefreshWidgetLayoutAndRedraw();
+            SetTimer(controller_window_,
+                     kDeferredStockSampleTimerId,
+                     kDeferredStockSampleDelayMs,
+                     nullptr);
+        }
+    }
+
+    void SwitchStockGroupByWheel(short delta) {
+        if (!stock_mode_ || stock_config_.stock_groups.size() <= 1) {
+            return;
+        }
+        const int notches = static_cast<int>(delta / WHEEL_DELTA);
+        if (notches == 0) {
+            return;
+        }
+        SilenceStockNotificationsForSwitch();
+        SetActiveStockGroupIndex(ActiveStockGroupIndex() - notches);
     }
 
     void SortStockRows() {
@@ -1092,6 +1425,29 @@ private:
             stock_config_.sort_mode == stock_taskbar_monitor::StockSortMode::kTopGainers;
         std::stable_sort(stock_rows_.begin(), stock_rows_.end(), [top_gainers](const StockRow& a,
                                                                                const StockRow& b) {
+            if (a.change_percent && !b.change_percent) {
+                return true;
+            }
+            if (!a.change_percent && b.change_percent) {
+                return false;
+            }
+            if (!a.change_percent && !b.change_percent) {
+                return false;
+            }
+            return top_gainers ? *a.change_percent > *b.change_percent
+                               : *a.change_percent < *b.change_percent;
+        });
+    }
+
+    void SortStockRows(std::vector<StockRow>& rows) const {
+        if (stock_config_.sort_mode == stock_taskbar_monitor::StockSortMode::kConfigOrder) {
+            return;
+        }
+
+        const bool top_gainers =
+            stock_config_.sort_mode == stock_taskbar_monitor::StockSortMode::kTopGainers;
+        std::stable_sort(rows.begin(), rows.end(), [top_gainers](const StockRow& a,
+                                                                 const StockRow& b) {
             if (a.change_percent && !b.change_percent) {
                 return true;
             }
@@ -1217,13 +1573,45 @@ private:
                             GetHoverPopupVisibleRowCount());
     }
 
+    int GetStockPopupVisibleRowCount() const {
+        return kStockPopupVisibleRows;
+    }
+
+    int GetStockPopupMaxScrollOffset() const {
+        return std::max(0,
+                        static_cast<int>(popup_stock_rows_.size()) -
+                            GetStockPopupVisibleRowCount());
+    }
+
+    bool ShouldShowStockPopupScrollBar() const {
+        return popup_stock_rows_.size() > static_cast<size_t>(GetStockPopupVisibleRowCount());
+    }
+
     void ClampHoverPopupScrollOffset() {
+        if (stock_mode_) {
+            hover_popup_scroll_offset_ =
+                std::clamp(hover_popup_scroll_offset_, 0, GetStockPopupMaxScrollOffset());
+            return;
+        }
         hover_popup_scroll_offset_ =
             std::clamp(hover_popup_scroll_offset_, 0, GetHoverPopupMaxScrollOffset());
     }
 
     void UpdateHoverPopupScrollBar() {
         if (hover_popup_window_ == nullptr || !IsWindow(hover_popup_window_)) {
+            return;
+        }
+        if (stock_mode_) {
+            ClampHoverPopupScrollOffset();
+            SCROLLINFO scroll_info{};
+            scroll_info.cbSize = sizeof(scroll_info);
+            scroll_info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            scroll_info.nMin = 0;
+            scroll_info.nMax = std::max(0, static_cast<int>(popup_stock_rows_.size()) - 1);
+            scroll_info.nPage = static_cast<UINT>(GetStockPopupVisibleRowCount());
+            scroll_info.nPos = hover_popup_scroll_offset_;
+            SetScrollInfo(hover_popup_window_, SB_VERT, &scroll_info, TRUE);
+            ShowScrollBar(hover_popup_window_, SB_VERT, ShouldShowStockPopupScrollBar());
             return;
         }
 
@@ -1667,6 +2055,8 @@ private:
     }
 
     void HandleHoverPopupVScroll(WPARAM scroll_code, int thumb_position) {
+        const int page_rows =
+            stock_mode_ ? GetStockPopupVisibleRowCount() : GetHoverPopupVisibleRowCount();
         switch (scroll_code) {
         case SB_LINEUP:
             ScrollHoverPopupBy(-1);
@@ -1675,16 +2065,17 @@ private:
             ScrollHoverPopupBy(1);
             break;
         case SB_PAGEUP:
-            ScrollHoverPopupBy(-GetHoverPopupVisibleRowCount());
+            ScrollHoverPopupBy(-page_rows);
             break;
         case SB_PAGEDOWN:
-            ScrollHoverPopupBy(GetHoverPopupVisibleRowCount());
+            ScrollHoverPopupBy(page_rows);
             break;
         case SB_TOP:
             SetHoverPopupScrollOffset(0);
             break;
         case SB_BOTTOM:
-            SetHoverPopupScrollOffset(GetHoverPopupMaxScrollOffset());
+            SetHoverPopupScrollOffset(stock_mode_ ? GetStockPopupMaxScrollOffset()
+                                                  : GetHoverPopupMaxScrollOffset());
             break;
         case SB_THUMBPOSITION:
         case SB_THUMBTRACK:
@@ -1702,13 +2093,48 @@ private:
         }
     }
 
+    std::vector<RECT> ComputeStockGroupTabRects(const RECT& client_rect) const {
+        std::vector<RECT> rects;
+        const size_t group_count =
+            std::min<size_t>(stock_config_.stock_groups.size(), stock_taskbar_monitor::kMaxStockGroups);
+        if (group_count == 0) {
+            return rects;
+        }
+
+        const int padding = ScaleByDpi(current_dpi_, 16);
+        const int gap = ScaleByDpi(current_dpi_, 6);
+        const int tab_height = GetStockGroupTabHeight();
+        const int content_left = client_rect.left + padding;
+        const int scroll_bar_width = ShouldShowStockPopupScrollBar() ? GetSystemMetrics(SM_CXVSCROLL) : 0;
+        const int content_right = client_rect.right - padding - scroll_bar_width;
+        const int title_bottom = client_rect.top + padding + popup_title_line_height_;
+        const int summary_bottom = title_bottom + ScaleByDpi(current_dpi_, 8) +
+                                   popup_text_line_height_;
+        const int tab_top = summary_bottom + ScaleByDpi(current_dpi_, 10);
+        const int available_width =
+            std::max(1, content_right - content_left - gap * (static_cast<int>(group_count) - 1));
+        const int base_width = available_width / static_cast<int>(group_count);
+        int x = content_left;
+        rects.reserve(group_count);
+        for (size_t index = 0; index < group_count; ++index) {
+            const bool last = index + 1 == group_count;
+            const int right = last ? content_right : x + base_width;
+            rects.push_back({x, tab_top, right, tab_top + tab_height});
+            x = right + gap;
+        }
+        return rects;
+    }
+
+    int GetStockGroupTabHeight() const {
+        return popup_text_line_height_ + ScaleByDpi(current_dpi_, 12);
+    }
+
     void UpdateHoverPopupSize() {
         if (stock_mode_) {
-            const int visible_rows =
-                std::max<int>(1, std::min<int>(static_cast<int>(stock_rows_.size()), 10));
-            hover_popup_size_.cx = ScaleByDpi(current_dpi_, 560);
-            hover_popup_size_.cy = ScaleByDpi(current_dpi_, 96) + popup_title_line_height_ +
-                                   GetHoverPopupRowHeight() * visible_rows +
+            hover_popup_size_.cx = ScaleByDpi(current_dpi_, 620);
+            hover_popup_size_.cy = ScaleByDpi(current_dpi_, 118) + popup_title_line_height_ +
+                                   GetStockGroupTabHeight() +
+                                   GetHoverPopupRowHeight() * GetStockPopupVisibleRowCount() +
                                    ScaleByDpi(current_dpi_, 24);
             return;
         }
@@ -1754,7 +2180,8 @@ private:
         const int gap = ScaleByDpi(current_dpi_, 8);
         const int cell_pad = ScaleByDpi(current_dpi_, 8);
         const int content_left = client_rect.left + padding;
-        const int content_right = client_rect.right - padding;
+        const int scroll_bar_width = ShouldShowStockPopupScrollBar() ? GetSystemMetrics(SM_CXVSCROLL) : 0;
+        const int content_right = client_rect.right - padding - scroll_bar_width;
 
         SetBkMode(dc, TRANSPARENT);
         HFONT title_font =
@@ -1776,8 +2203,10 @@ private:
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
         const std::wstring subtitle = IsChinese()
-                                          ? std::to_wstring(stock_rows_.size()) + L" 个股票"
-                                          : std::to_wstring(stock_rows_.size()) + L" symbols shown";
+                                          ? PopupStockGroupName() + L"  " +
+                                                std::to_wstring(popup_stock_rows_.size()) + L" 个股票"
+                                          : PopupStockGroupName() + L"  " +
+                                                std::to_wstring(popup_stock_rows_.size()) + L" symbols";
         SetTextColor(dc, palette.secondary_text);
         DrawTextW(dc,
                   subtitle.c_str(),
@@ -1791,9 +2220,9 @@ private:
                           content_right,
                           title_rect.bottom + gap + popup_text_line_height_};
         const std::wstring summary =
-            std::wstring(Text(L"Updated ", L"更新时间 ")) + stock_last_update_time_ + L"   USD/HKD " +
-            FormatPriceValue(stock_config_.usd_hkd_rate) + L"   Alpaca " +
-            stock_config_.alpaca_feed;
+            std::wstring(Text(L"Updated ", L"更新时间 ")) +
+            PopupStockLastUpdateTime() + L"   USD/HKD " +
+            FormatPriceValue(stock_config_.usd_hkd_rate) + L"   Alpaca " + stock_config_.alpaca_feed;
         SetTextColor(dc, palette.secondary_text);
         DrawTextW(dc,
                   summary.c_str(),
@@ -1801,10 +2230,41 @@ private:
                   &summary_rect,
                   DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
+        const auto group_tab_rects = ComputeStockGroupTabRects(client_rect);
+        const int tab_height = GetStockGroupTabHeight();
+        const int tab_top = summary_rect.bottom + ScaleByDpi(current_dpi_, 10);
+        const int tab_radius = ScaleByDpi(current_dpi_, 7);
+        for (size_t index = 0; index < group_tab_rects.size(); ++index) {
+            const auto& rect = group_tab_rects[index];
+            const bool active = static_cast<int>(index) == PopupStockGroupIndex();
+            const COLORREF fill_color = active ? palette.header_fill : palette.row_highlight;
+            const COLORREF border_color = active ? palette.search_active_border : palette.border;
+            HBRUSH tab_brush = CreateSolidBrush(fill_color);
+            HPEN tab_pen = CreatePen(PS_SOLID, 1, border_color);
+            HGDIOBJ old_brush = SelectObject(dc, tab_brush);
+            HGDIOBJ old_pen = SelectObject(dc, tab_pen);
+            RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, tab_radius, tab_radius);
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            DeleteObject(tab_pen);
+            DeleteObject(tab_brush);
+
+            RECT text_rect{rect.left + ScaleByDpi(current_dpi_, 10),
+                           rect.top,
+                           rect.right - ScaleByDpi(current_dpi_, 10),
+                           rect.bottom};
+            SetTextColor(dc, active ? palette.primary_text : palette.secondary_text);
+            DrawTextW(dc,
+                      stock_config_.stock_groups[index].name.c_str(),
+                      -1,
+                      &text_rect,
+                      DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+
         RECT header_rect{content_left,
-                         summary_rect.bottom + gap,
+                         tab_top + tab_height + gap,
                          content_right,
-                         summary_rect.bottom + gap + popup_text_line_height_ +
+                         tab_top + tab_height + gap + popup_text_line_height_ +
                              ScaleByDpi(current_dpi_, 8)};
         HBRUSH header_brush = CreateSolidBrush(palette.header_fill);
         FillRect(dc, &header_rect, header_brush);
@@ -1845,9 +2305,16 @@ private:
 
         const int row_height = GetHoverPopupRowHeight();
         int row_top = header_rect.bottom;
-        const int end_index = std::min<int>(static_cast<int>(stock_rows_.size()), 10);
+        const int start_index =
+            std::min<int>(hover_popup_scroll_offset_, static_cast<int>(popup_stock_rows_.size()));
+        const int end_index =
+            std::min<int>(start_index + GetStockPopupVisibleRowCount(),
+                          static_cast<int>(popup_stock_rows_.size()));
         for (int index = 0; index < end_index; ++index) {
-            const StockRow& row = stock_rows_[index];
+            if (index < start_index) {
+                continue;
+            }
+            const StockRow& row = popup_stock_rows_[static_cast<size_t>(index)];
             RECT row_rect{content_left, row_top, content_right, row_top + row_height};
             if ((index % 2) == 0) {
                 HBRUSH row_brush = CreateSolidBrush(palette.row_highlight);
@@ -1888,9 +2355,10 @@ private:
         }
 
         RECT footer_rect{content_left,
-                         row_top + gap,
+                         header_rect.bottom + GetHoverPopupRowHeight() * GetStockPopupVisibleRowCount() + gap,
                          content_right,
-                         row_top + gap + popup_text_line_height_};
+                         header_rect.bottom + GetHoverPopupRowHeight() * GetStockPopupVisibleRowCount() +
+                             gap + popup_text_line_height_};
         SetTextColor(dc, palette.secondary_text);
         DrawTextW(dc,
                   Text(L"* Change is calculated against previous close when available.",
@@ -2311,6 +2779,20 @@ private:
         SelectObject(dc, old_font);
     }
 
+    void HandleStockHoverPopupClick(const POINT& client_point) {
+        RECT client_rect{0, 0, hover_popup_size_.cx, hover_popup_size_.cy};
+        if (hover_popup_window_ != nullptr && IsWindow(hover_popup_window_)) {
+            GetClientRect(hover_popup_window_, &client_rect);
+        }
+        const auto tab_rects = ComputeStockGroupTabRects(client_rect);
+        for (size_t index = 0; index < tab_rects.size(); ++index) {
+            if (PtInRect(&tab_rects[index], client_point)) {
+                SetPopupStockGroupIndex(static_cast<int>(index));
+                return;
+            }
+        }
+    }
+
     void PaintHoverPopup() {
         PAINTSTRUCT paint_struct{};
         HDC dc = BeginPaint(hover_popup_window_, &paint_struct);
@@ -2420,6 +2902,9 @@ private:
         }
 
         KillTimer(controller_window_, kHoverHideTimerId);
+        if (stock_mode_) {
+            ResetPopupStockGroupToTaskbarGroup();
+        }
         RefreshHoverPopupData();
         PositionHoverPopup();
         ShowWindow(hover_popup_window_, activate ? SW_SHOW : SW_SHOWNOACTIVATE);
@@ -2551,15 +3036,29 @@ private:
                      RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 
+    void RefreshWidgetLayoutAndRedraw() {
+        RefreshFontAndSize();
+        if (embedder_.IsAttached()) {
+            if (!embedder_.RefreshLayout(widget_window_, widget_size_)) {
+                ShowWindow(widget_window_, SW_HIDE);
+                SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+                HideHoverPopup();
+                return;
+            }
+        }
+
+        RequestWidgetRedraw();
+        if (hover_popup_visible_) {
+            PositionHoverPopup();
+            UpdateHoverPopupScrollBar();
+            RequestHoverPopupRedraw();
+        }
+    }
+
     void SampleAndRefresh() {
         if (stock_mode_) {
             SampleStocks();
-            RefreshFontAndSize();
-            RequestWidgetRedraw();
-            if (hover_popup_visible_) {
-                PositionHoverPopup();
-                RequestHoverPopupRedraw();
-            }
+            RefreshWidgetLayoutAndRedraw();
             return;
         }
 
@@ -2590,14 +3089,17 @@ private:
         HideHoverPopup();
         hover_popup_scroll_offset_ = 0;
         hover_popup_search_text_.clear();
+        KillTimer(controller_window_, kDeferredStockSampleTimerId);
 
         if (stock_mode_) {
             SetTimer(controller_window_,
                      kSampleTimerId,
                      std::max(1u, stock_config_.sample_interval_seconds) * 1000u,
                      nullptr);
+            SilenceStockNotificationsForSwitch();
             SampleStocks();
         } else {
+            FlushDeferredStockConfigSave();
             SetTimer(controller_window_,
                      kSampleTimerId,
                      GetSampleTimerIntervalMs(app_config_.sample_interval_seconds),
@@ -2617,69 +3119,61 @@ private:
     }
 
     void ReloadStockConfig() {
+        CancelDeferredStockConfigSave();
         stock_config_ = stock_taskbar_monitor::LoadOrCreateConfig();
-        stock_active_alerts_.clear();
+        stock_group_rows_cache_.clear();
+        stock_group_last_update_time_.clear();
         if (stock_mode_) {
             SampleStocks();
-            RefreshFontAndSize();
-            RequestWidgetRedraw();
             if (hover_popup_visible_) {
-                PositionHoverPopup();
-                RequestHoverPopupRedraw();
+                ResetPopupStockGroupToTaskbarGroup();
             }
+            RefreshWidgetLayoutAndRedraw();
         }
     }
 
     void ShowStockConfigDialog() {
+        CancelDeferredStockConfigSave();
         if (!stock_taskbar_monitor::ShowStockConfigDialog(controller_window_,
                                                           instance_handle_,
                                                           IsChinese(),
                                                           &stock_config_)) {
             return;
         }
-        stock_active_alerts_.clear();
+        stock_config_ = stock_taskbar_monitor::LoadOrCreateConfig();
+        stock_group_rows_cache_.clear();
+        stock_group_last_update_time_.clear();
         if (stock_mode_) {
             SampleStocks();
-            RefreshFontAndSize();
-            RequestWidgetRedraw();
             if (hover_popup_visible_) {
-                PositionHoverPopup();
-                RequestHoverPopupRedraw();
+                ResetPopupStockGroupToTaskbarGroup();
             }
-            if (embedder_.IsAttached()) {
-                embedder_.RefreshLayout(widget_window_, widget_size_);
-            }
+            RefreshWidgetLayoutAndRedraw();
         }
     }
 
     void SetStockTaskbarSymbolCount(unsigned int count) {
         stock_config_.taskbar_symbol_count = count;
-        stock_taskbar_monitor::SaveConfig(stock_config_);
+        SaveStockConfigImmediate();
         if (stock_mode_) {
             UpdateStockDisplayLines();
-            RefreshFontAndSize();
-            RequestWidgetRedraw();
-            if (embedder_.IsAttached()) {
-                embedder_.RefreshLayout(widget_window_, widget_size_);
-            }
+            RefreshWidgetLayoutAndRedraw();
         }
     }
 
     void SetStockSortMode(stock_taskbar_monitor::StockSortMode sort_mode) {
         stock_config_.sort_mode = sort_mode;
-        stock_taskbar_monitor::SaveConfig(stock_config_);
+        SaveStockConfigImmediate();
         SortStockRows();
+        stock_group_rows_cache_[stock_config_.active_group] = stock_rows_;
+        if (_wcsicmp(PopupStockGroupName().c_str(), stock_config_.active_group.c_str()) == 0) {
+            popup_stock_rows_ = stock_rows_;
+        } else {
+            SortStockRows(popup_stock_rows_);
+        }
         if (stock_mode_) {
             UpdateStockDisplayLines();
-            RefreshFontAndSize();
-            RequestWidgetRedraw();
-            if (hover_popup_visible_) {
-                PositionHoverPopup();
-                RequestHoverPopupRedraw();
-            }
-            if (embedder_.IsAttached()) {
-                embedder_.RefreshLayout(widget_window_, widget_size_);
-            }
+            RefreshWidgetLayoutAndRedraw();
         }
     }
 
@@ -2790,62 +3284,372 @@ private:
         return true;
     }
 
+    static void LayoutHelpDialog(HelpDialogState& state, int width, int height) {
+        const UINT dpi = GetDpiForWindow(state.window);
+        const int margin = ScaleByDpi(dpi, 22);
+        const int gap = ScaleByDpi(dpi, 10);
+        const int label_height = ScaleByDpi(dpi, 20);
+        const int title_height = ScaleByDpi(dpi, 30);
+        const int edit_height = ScaleByDpi(dpi, 28);
+        const int button_height = ScaleByDpi(dpi, 30);
+        const int button_width = ScaleByDpi(dpi, 116);
+        const int close_width = ScaleByDpi(dpi, 92);
+
+        if (state.title_label != nullptr) {
+            MoveWindow(state.title_label, margin, margin, width - margin * 2, title_height, TRUE);
+        }
+
+        const int project_top = margin + title_height + gap;
+        if (state.project_label_window != nullptr) {
+            MoveWindow(state.project_label_window, margin, project_top, width - margin * 2, label_height, TRUE);
+        }
+
+        const int url_top = project_top + label_height + ScaleByDpi(dpi, 4);
+        MoveWindow(state.open_button,
+                   width - margin - button_width,
+                   url_top,
+                   button_width,
+                   edit_height,
+                   TRUE);
+        MoveWindow(state.url_edit,
+                   margin,
+                   url_top,
+                   width - margin * 3 - button_width,
+                   edit_height,
+                   TRUE);
+
+        const int body_top = url_top + edit_height + gap;
+        const int footer_top = height - margin - button_height;
+        MoveWindow(state.body_edit,
+                   margin,
+                   body_top,
+                   width - margin * 2,
+                   std::max(ScaleByDpi(dpi, 120), footer_top - body_top - gap),
+                   TRUE);
+        MoveWindow(state.close_button,
+                   width - margin - close_width,
+                   footer_top,
+                   close_width,
+                   button_height,
+                   TRUE);
+    }
+
+    static LRESULT CALLBACK HelpWindowProc(HWND window_handle,
+                                           UINT message,
+                                           WPARAM w_param,
+                                           LPARAM l_param) {
+        HelpDialogState* state = nullptr;
+        if (message == WM_NCCREATE) {
+            auto* create_struct = reinterpret_cast<CREATESTRUCTW*>(l_param);
+            state = static_cast<HelpDialogState*>(create_struct->lpCreateParams);
+            state->window = window_handle;
+            SetWindowLongPtrW(window_handle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        } else {
+            state = reinterpret_cast<HelpDialogState*>(GetWindowLongPtrW(window_handle, GWLP_USERDATA));
+        }
+
+        if (state == nullptr) {
+            return DefWindowProcW(window_handle, message, w_param, l_param);
+        }
+
+        switch (message) {
+        case WM_CREATE: {
+            const UINT dpi = GetDpiForWindow(window_handle);
+            state->title_font = CreateFontW(-ScaleByDpi(dpi, 18),
+                                            0,
+                                            0,
+                                            0,
+                                            FW_SEMIBOLD,
+                                            FALSE,
+                                            FALSE,
+                                            FALSE,
+                                            DEFAULT_CHARSET,
+                                            OUT_DEFAULT_PRECIS,
+                                            CLIP_DEFAULT_PRECIS,
+                                            CLEARTYPE_QUALITY,
+                                            DEFAULT_PITCH | FF_SWISS,
+                                            L"Segoe UI");
+            state->body_font = CreatePreferredUiFont(dpi, 13);
+
+            state->title_label = CreateWindowExW(0,
+                                                 L"STATIC",
+                                                 state->title.c_str(),
+                                                 WS_CHILD | WS_VISIBLE,
+                                                 0,
+                                                 0,
+                                                 0,
+                                                 0,
+                                                 window_handle,
+                                                 nullptr,
+                                                 nullptr,
+                                                 nullptr);
+            SendMessageW(state->title_label, WM_SETFONT, reinterpret_cast<WPARAM>(state->title_font), TRUE);
+
+            state->project_label_window = CreateWindowExW(0,
+                                                          L"STATIC",
+                                                          state->project_label.c_str(),
+                                                          WS_CHILD | WS_VISIBLE,
+                                                          0,
+                                                          0,
+                                                          0,
+                                                          0,
+                                                          window_handle,
+                                                          nullptr,
+                                                          nullptr,
+                                                          nullptr);
+            SendMessageW(state->project_label_window,
+                         WM_SETFONT,
+                         reinterpret_cast<WPARAM>(state->body_font),
+                         TRUE);
+
+            state->url_edit =
+                CreateWindowExW(WS_EX_CLIENTEDGE,
+                                L"EDIT",
+                                state->project_url.c_str(),
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_READONLY | ES_AUTOHSCROLL,
+                                0,
+                                0,
+                                0,
+                                0,
+                                window_handle,
+                                reinterpret_cast<HMENU>(kHelpUrlEditId),
+                                nullptr,
+                                nullptr);
+            SendMessageW(state->url_edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->body_font), TRUE);
+
+            state->open_button = CreateWindowExW(0,
+                                                 L"BUTTON",
+                                                 state->open_label.c_str(),
+                                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                                 0,
+                                                 0,
+                                                 0,
+                                                 0,
+                                                 window_handle,
+                                                 reinterpret_cast<HMENU>(kHelpOpenProjectButtonId),
+                                                 nullptr,
+                                                 nullptr);
+            SendMessageW(state->open_button,
+                         WM_SETFONT,
+                         reinterpret_cast<WPARAM>(state->body_font),
+                         TRUE);
+
+            state->body_edit =
+                CreateWindowExW(WS_EX_CLIENTEDGE,
+                                L"EDIT",
+                                state->body.c_str(),
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE |
+                                    ES_READONLY | ES_AUTOVSCROLL,
+                                0,
+                                0,
+                                0,
+                                0,
+                                window_handle,
+                                reinterpret_cast<HMENU>(kHelpBodyEditId),
+                                nullptr,
+                                nullptr);
+            SendMessageW(state->body_edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->body_font), TRUE);
+
+            state->close_button = CreateWindowExW(0,
+                                                  L"BUTTON",
+                                                  state->close_label.c_str(),
+                                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                                  0,
+                                                  0,
+                                                  0,
+                                                  0,
+                                                  window_handle,
+                                                  reinterpret_cast<HMENU>(kHelpCloseButtonId),
+                                                  nullptr,
+                                                  nullptr);
+            SendMessageW(state->close_button,
+                         WM_SETFONT,
+                         reinterpret_cast<WPARAM>(state->body_font),
+                         TRUE);
+            return 0;
+        }
+        case WM_SIZE:
+            LayoutHelpDialog(*state, LOWORD(l_param), HIWORD(l_param));
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(w_param) == kHelpOpenProjectButtonId) {
+                ShellExecuteW(window_handle,
+                              L"open",
+                              state->project_url.c_str(),
+                              nullptr,
+                              nullptr,
+                              SW_SHOWNORMAL);
+                return 0;
+            }
+            if (LOWORD(w_param) == kHelpCloseButtonId || LOWORD(w_param) == IDOK ||
+                LOWORD(w_param) == IDCANCEL) {
+                DestroyWindow(window_handle);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(window_handle);
+            return 0;
+        case WM_NCDESTROY:
+            if (state->title_font != nullptr) {
+                DeleteObject(state->title_font);
+                state->title_font = nullptr;
+            }
+            if (state->body_font != nullptr) {
+                DeleteObject(state->body_font);
+                state->body_font = nullptr;
+            }
+            SetWindowLongPtrW(window_handle, GWLP_USERDATA, 0);
+            return 0;
+        default:
+            break;
+        }
+
+        return DefWindowProcW(window_handle, message, w_param, l_param);
+    }
+
+    void ShowCustomHelpDialog(const std::wstring& body) {
+        HelpDialogState state;
+        state.owner = controller_window_;
+        state.title = L"Minimal Taskbar Monitor V0.3";
+        state.project_url = kProjectUrl;
+        state.body = body;
+        state.project_label = Text(L"Project URL", L"项目地址");
+        state.open_label = Text(L"Open GitHub", L"打开 GitHub");
+        state.close_label = Text(L"Close", L"关闭");
+
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = HelpWindowProc;
+        window_class.hInstance = instance_handle_;
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.hIcon = tray_icon_handle_ != nullptr ? tray_icon_handle_ : LoadIconW(nullptr, IDI_INFORMATION);
+        window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        window_class.lpszClassName = kHelpDialogClassName;
+        RegisterClassExW(&window_class);
+
+        const UINT dpi = controller_window_ != nullptr && IsWindow(controller_window_)
+                             ? GetDpiForWindow(controller_window_)
+                             : 96;
+        const int width = ScaleByDpi(dpi, 720);
+        const int height = ScaleByDpi(dpi, 640);
+        HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME,
+                                      kHelpDialogClassName,
+                                      Text(L"Help", L"帮助"),
+                                      WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_THICKFRAME,
+                                      CW_USEDEFAULT,
+                                      CW_USEDEFAULT,
+                                      width,
+                                      height,
+                                      controller_window_,
+                                      nullptr,
+                                      instance_handle_,
+                                      &state);
+        if (window == nullptr) {
+            MessageBoxW(controller_window_, body.c_str(), Text(L"Help", L"帮助"), MB_OK);
+            return;
+        }
+
+        RECT owner_rect{};
+        if (controller_window_ != nullptr && IsWindow(controller_window_)) {
+            GetWindowRect(controller_window_, &owner_rect);
+        }
+        if (owner_rect.right <= owner_rect.left || owner_rect.bottom <= owner_rect.top) {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &owner_rect, 0);
+        }
+        const int x = std::max<int>(
+            0, static_cast<int>(owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2));
+        const int y = std::max<int>(
+            0, static_cast<int>(owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2));
+        SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+        if (controller_window_ != nullptr && IsWindow(controller_window_)) {
+            EnableWindow(controller_window_, FALSE);
+        }
+        ShowWindow(window, SW_SHOW);
+        UpdateWindow(window);
+
+        MSG message{};
+        while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (!IsDialogMessageW(window, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        if (controller_window_ != nullptr && IsWindow(controller_window_)) {
+            EnableWindow(controller_window_, TRUE);
+            SetForegroundWindow(controller_window_);
+        }
+    }
+
     void ShowHelpDialog() {
         const HotkeySpec spec = GetToggleHotkeySpec(app_config_.toggle_hotkey);
         std::wstring message;
         if (IsChinese()) {
-            message += L"Minimal Taskbar Monitor\n\n";
-            message += L"状态模式显示 CPU、内存、网络、GPU、磁盘和进程悬浮窗。\n";
-            message += L"股票模式在任务栏显示配置的股价，并在悬浮窗显示股票详情。\n\n";
-            message += L"快捷键：\n  ";
+            message += L"概览\r\n";
+            message += L"状态模式显示 CPU、内存、网络、GPU、磁盘和进程悬浮窗。\r\n";
+            message += L"股票模式在任务栏显示配置的股价，并在悬浮窗显示股票详情。\r\n\r\n";
+            message += L"快捷键\r\n  ";
             message += spec.label;
-            message += L" 在状态模式和股票模式之间切换。\n\n";
-            message += L"菜单：\n";
-            message += L"  状态：性能监视器设置。\n";
-            message += L"  股票：股票模式、重载股票配置、任务栏显示数量和排序。\n";
-            message += L"  快捷键：选择模式切换快捷键。\n";
-            message += L"  语言：切换界面语言。\n\n";
-            message += L"配置文件位于 exe 同目录：\n";
-            message += L"  config.json：程序和状态监视设置。\n";
-            message += L"  stocks_config.json：股票列表和 Alpaca key。\n\n";
-            message += L"股票配置格式：\n";
-            message += L"  港股：market=\"hk\"，code 写 5 位港股代码，例如 09988。\n";
-            message += L"  A 股：market=\"cn\"，code 写 6 位代码；6 开头自动走上交所 sh，0/3 开头走深交所 sz。\n";
-            message += L"  美股：market=\"us\" 或 source=\"alpaca\"，code 写美股 ticker，例如 NVDA。\n";
-            message += L"  show_usd 只用于港股 ADR 折算；adr_factor 是 ADR 换算倍数。\n\n";
-            message += L"示例：\n";
-            message += L"  \"PINGAN\": { \"code\": \"000001\", \"market\": \"cn\" }\n";
-            message += L"  \"BABA\": { \"code\": \"09988\", \"market\": \"hk\", \"show_usd\": true, \"adr_factor\": 8 }\n";
+            message += L" 在状态模式和股票模式之间切换。\r\n\r\n";
+            message += L"分组与切换\r\n";
+            message += L"  任务栏控件：鼠标悬停后滚轮切换自选列表。\r\n";
+            message += L"  股票悬浮窗顶部：tab 只临时切换展示分组，不会改变任务栏当前列表，也不会保存。\r\n";
+            message += L"  股票悬浮窗内部滚轮：只滚动表格内容，不切换分组。\r\n";
+            message += L"  每次重新打开股票悬浮窗时，默认展示当前任务栏激活的列表。\r\n\r\n";
+            message += L"菜单\r\n";
+            message += L"  状态：性能监视器设置。\r\n";
+            message += L"  股票：股票模式、重载股票配置、任务栏显示数量和排序。\r\n";
+            message += L"  快捷键：选择模式切换快捷键。\r\n";
+            message += L"  语言：切换界面语言。\r\n\r\n";
+            message += L"配置文件位于 exe 同目录\r\n";
+            message += L"  config.json：程序和状态监视设置。\r\n";
+            message += L"  stocks_config.json：股票列表和 Alpaca key。\r\n\r\n";
+            message += L"股票配置格式\r\n";
+            message += L"  港股：market=\"hk\"，code 写 5 位港股代码，例如 09988。\r\n";
+            message += L"  A 股：market=\"cn\"，code 写 6 位代码；6 开头自动走上交所 sh，0/3 开头走深交所 sz。\r\n";
+            message += L"  美股：market=\"us\" 或 source=\"alpaca\"，code 写美股 ticker，例如 NVDA。\r\n";
+            message += L"  多个自选列表写在 _groups 里，_settings.active_group 指定当前列表；最多读取前 6 个分组。\r\n";
+            message += L"  show_usd 只用于港股 ADR 折算；adr_factor 是 ADR 换算倍数。\r\n\r\n";
+            message += L"示例\r\n";
+            message += L"  \"_groups\": { \"HK\": { ... }, \"US\": { ... } }\r\n";
+            message += L"  \"PINGAN\": { \"code\": \"000001\", \"market\": \"cn\" }\r\n";
+            message += L"  \"BABA\": { \"code\": \"09988\", \"market\": \"hk\", \"show_usd\": true, \"adr_factor\": 8 }\r\n";
             message += L"  \"NVDA\": { \"code\": \"NVDA\", \"market\": \"us\", \"source\": \"alpaca\" }";
         } else {
-            message += L"Minimal Taskbar Monitor\n\n";
-            message += L"Status mode shows CPU, memory, network, GPU, disk, and the process popup.\n";
-            message += L"Stock mode shows configured stock prices in the taskbar and stock details in the popup.\n\n";
-            message += L"Shortcut:\n  ";
+            message += L"Overview\r\n";
+            message += L"Status mode shows CPU, memory, network, GPU, disk, and the process popup.\r\n";
+            message += L"Stock mode shows configured stock prices in the taskbar and stock details in the popup.\r\n\r\n";
+            message += L"Shortcut\r\n  ";
             message += spec.label;
-            message += L" toggles between Status and Stock mode.\n\n";
-            message += L"Menus:\n";
-            message += L"  Status: performance monitor settings.\n";
-            message += L"  Stock: stock mode, stock config reload, taskbar symbol count, and sorting.\n";
-            message += L"  Hotkey: choose the mode-toggle shortcut.\n";
-            message += L"  Language: switch UI language.\n\n";
-            message += L"Config files are stored next to the exe:\n";
-            message += L"  config.json for app/status settings.\n";
-            message += L"  stocks_config.json for stock targets and Alpaca keys.\n\n";
-            message += L"Stock config basics:\n";
-            message += L"  HK: market=\"hk\", code is the 5-digit HK code, for example 09988.\n";
-            message += L"  CN A-shares: market=\"cn\", code is the 6-digit code; 6-prefix uses Shanghai sh, 0/3-prefix uses Shenzhen sz.\n";
-            message += L"  US: market=\"us\" or source=\"alpaca\", code is the US ticker, for example NVDA.\n";
-            message += L"  show_usd only applies to HK ADR conversion; adr_factor is the ADR ratio.\n\n";
-            message += L"Examples:\n";
-            message += L"  \"PINGAN\": { \"code\": \"000001\", \"market\": \"cn\" }\n";
-            message += L"  \"BABA\": { \"code\": \"09988\", \"market\": \"hk\", \"show_usd\": true, \"adr_factor\": 8 }\n";
+            message += L" toggles between Status and Stock mode.\r\n\r\n";
+            message += L"Groups and switching\r\n";
+            message += L"  Taskbar widget: hover and use the mouse wheel to switch watchlists.\r\n";
+            message += L"  Stock popup tabs: temporary view switching only; they do not change or save the taskbar watchlist.\r\n";
+            message += L"  Stock popup mouse wheel: scrolls table rows only; it does not switch groups.\r\n";
+            message += L"  Each time the stock popup opens, it starts from the current taskbar watchlist.\r\n\r\n";
+            message += L"Menus\r\n";
+            message += L"  Status: performance monitor settings.\r\n";
+            message += L"  Stock: stock mode, stock config reload, taskbar symbol count, and sorting.\r\n";
+            message += L"  Hotkey: choose the mode-toggle shortcut.\r\n";
+            message += L"  Language: switch UI language.\r\n\r\n";
+            message += L"Config files are stored next to the exe\r\n";
+            message += L"  config.json for app/status settings.\r\n";
+            message += L"  stocks_config.json for stock targets and Alpaca keys.\r\n\r\n";
+            message += L"Stock config basics\r\n";
+            message += L"  HK: market=\"hk\", code is the 5-digit HK code, for example 09988.\r\n";
+            message += L"  CN A-shares: market=\"cn\", code is the 6-digit code; 6-prefix uses Shanghai sh, 0/3-prefix uses Shenzhen sz.\r\n";
+            message += L"  US: market=\"us\" or source=\"alpaca\", code is the US ticker, for example NVDA.\r\n";
+            message += L"  Multiple watchlists live under _groups; _settings.active_group selects the current list. Only the first 6 groups are loaded.\r\n";
+            message += L"  show_usd only applies to HK ADR conversion; adr_factor is the ADR ratio.\r\n\r\n";
+            message += L"Examples\r\n";
+            message += L"  \"_groups\": { \"HK\": { ... }, \"US\": { ... } }\r\n";
+            message += L"  \"PINGAN\": { \"code\": \"000001\", \"market\": \"cn\" }\r\n";
+            message += L"  \"BABA\": { \"code\": \"09988\", \"market\": \"hk\", \"show_usd\": true, \"adr_factor\": 8 }\r\n";
             message += L"  \"NVDA\": { \"code\": \"NVDA\", \"market\": \"us\", \"source\": \"alpaca\" }";
         }
-        MessageBoxW(controller_window_,
-                    message.c_str(),
-                    Text(L"Help", L"帮助"),
-                    MB_OK | MB_ICONINFORMATION);
+        ShowCustomHelpDialog(message);
     }
 
     bool SaveConfig() const {
@@ -3599,6 +4403,7 @@ private:
             app->HideHoverPopup();
             app->embedder_.Detach(app->widget_window_);
             app->tray_icon_added_ = false;
+            app->FlushDeferredStockConfigSave();
             SetTimer(window_handle, kReattachTimerId, kReattachDelayMs, nullptr);
             return 0;
         }
@@ -3615,6 +4420,17 @@ private:
         case WM_TIMER:
             if (w_param == kSampleTimerId) {
                 app->SampleAndRefresh();
+                return 0;
+            }
+            if (w_param == kDeferredStockSampleTimerId) {
+                KillTimer(window_handle, kDeferredStockSampleTimerId);
+                if (app->stock_mode_) {
+                    app->SampleAndRefresh();
+                }
+                return 0;
+            }
+            if (w_param == kDeferredStockConfigSaveTimerId) {
+                app->FlushDeferredStockConfigSave();
                 return 0;
             }
             if (w_param == kLayoutTimerId) {
@@ -3698,6 +4514,12 @@ private:
         case WM_MOUSELEAVE:
             app->ArmHoverHideTimer();
             return 0;
+        case WM_MOUSEWHEEL:
+            if (app->stock_mode_) {
+                app->SwitchStockGroupByWheel(GET_WHEEL_DELTA_WPARAM(w_param));
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
             app->HandleWidgetLeftButtonDown();
             return 0;
@@ -3769,6 +4591,10 @@ private:
             app->HandleHoverPopupVScroll(LOWORD(w_param), HIWORD(w_param));
             return 0;
         case WM_MOUSEWHEEL:
+            if (app->stock_mode_) {
+                app->HandleHoverPopupMouseWheel(GET_WHEEL_DELTA_WPARAM(w_param));
+                return 0;
+            }
             app->HandleHoverPopupMouseWheel(GET_WHEEL_DELTA_WPARAM(w_param));
             return 0;
         case WM_MOUSEMOVE:
@@ -3803,6 +4629,8 @@ private:
             return 0;
         case WM_LBUTTONUP: {
             if (app->stock_mode_) {
+                POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
+                app->HandleStockHoverPopupClick(point);
                 return 0;
             }
             POINT point{GET_X_LPARAM(l_param), GET_Y_LPARAM(l_param)};
@@ -3864,8 +4692,10 @@ private:
     ULONG_PTR gdiplus_token_{0};
     bool gdiplus_started_{false};
     ULONGLONG app_start_tick_ms_{GetTickCount64()};
+    ULONGLONG stock_notification_silenced_until_ms_{0};
     AppConfig app_config_{};
     bool stock_mode_{false};
+    bool stock_config_save_pending_{false};
     stock_taskbar_monitor::AppConfig stock_config_{};
     MetricsSnapshot last_snapshot_{};
     ProcessPopupSnapshot hover_popup_base_snapshot_{};
@@ -3876,7 +4706,11 @@ private:
     std::wstring line1_text_{L"CPU 0%  MEM 0%"};
     std::wstring line2_text_{L"\u2191 0bps  \u2193 0bps  R 0B/s  W 0B/s"};
     std::wstring stock_last_update_time_{L"--:--:--"};
+    std::wstring popup_stock_group_{};
     std::vector<StockRow> stock_rows_{};
+    std::vector<StockRow> popup_stock_rows_{};
+    std::map<std::wstring, std::vector<StockRow>> stock_group_rows_cache_{};
+    std::map<std::wstring, std::wstring> stock_group_last_update_time_{};
     std::set<std::wstring> stock_active_alerts_{};
     std::vector<DisplayLines::Column> display_columns_{};
     std::vector<int> column_widths_{};

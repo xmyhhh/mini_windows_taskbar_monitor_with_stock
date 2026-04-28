@@ -1,8 +1,10 @@
-# stock_taskbar_monitor
+# stock_taskbar_monitor V0.3
 
 一个基于 `minimal_taskbar_monitor` 任务栏嵌入逻辑的 Windows 任务栏监视器。
 
 默认启动是系统资源监视模式，外观和交互尽量保持参考项目风格。通过快捷键切换到股票模式后，任务栏显示简洁股价，悬浮窗显示股票详情、当日涨跌幅和市场信息。
+
+项目地址：https://github.com/xmyhhh/mini_windows_taskbar_monitor_with_stock
 
 ## 功能
 
@@ -14,6 +16,8 @@
 - 可配置模式切换快捷键
 - 支持鼠标悬停弹窗和点击弹窗
 - 股票可按配置顺序、当日涨幅、当日跌幅排序
+- 支持多个股票分组 / 多个自选列表
+- 股票模式下，任务栏控件支持滚轮快速切换自选列表，股票悬浮窗顶部支持临时 tab 切换
 - 任务栏股票显示数量可选 2 / 4 / 6 / 8
 - 默认英文界面，可在菜单切换中文
 - 托盘图标、开机启动、图标嵌入
@@ -88,6 +92,8 @@ build/Release/stock_taskbar_monitor.exe
 - `Taskbar Symbols`：任务栏显示股票数量，2 / 4 / 6 / 8
 - `Sort`：按配置顺序、当日涨幅、当日跌幅排序
 
+股票模式下，鼠标悬停在任务栏控件上时，滚轮可以在不同自选列表之间快速切换；股票悬浮窗顶部提供 tab 临时切换分组，不会改变任务栏当前列表。
+
 ## 配置文件
 
 程序会在 exe 同目录生成配置文件：
@@ -121,25 +127,34 @@ stocks_config.json
     "alpaca_feed": "iex",
     "popup_activation_mode": "hover",
     "taskbar_symbol_count": 4,
-    "sort_mode": "config"
+    "sort_mode": "config",
+    "active_group": "HK"
   },
-  "BABA": {
-    "code": "09988",
-    "market": "hk",
-    "adr_factor": 8,
-    "show_usd": true,
-    "min_price": 170,
-    "max_price": 175
-  },
-  "PINGAN": {
-    "code": "000001",
-    "market": "cn"
-  },
-  "NVDA": {
-    "code": "NVDA",
-    "market": "us",
-    "source": "alpaca",
-    "alpaca_feed": "iex"
+  "_groups": {
+    "HK": {
+      "BABA": {
+        "code": "09988",
+        "market": "hk",
+        "adr_factor": 8,
+        "show_usd": true,
+        "min_price": 170,
+        "max_price": 175
+      }
+    },
+    "CN": {
+      "PINGAN": {
+        "code": "000001",
+        "market": "cn"
+      }
+    },
+    "US": {
+      "NVDA": {
+        "code": "NVDA",
+        "market": "us",
+        "source": "alpaca",
+        "alpaca_feed": "iex"
+      }
+    }
   }
 }
 ```
@@ -155,6 +170,39 @@ stocks_config.json
 - `popup_activation_mode`：弹窗模式，`hover` 或 `click`
 - `taskbar_symbol_count`：任务栏股票数量，只支持 `2`、`4`、`6`、`8`
 - `sort_mode`：股票排序方式，`config`、`top_gainers`、`top_losers`
+- `active_group`：当前启用的自选列表名称
+
+## 多分组 / 自选列表
+
+多个自选列表配置在 `_groups` 下：
+
+```json
+"_groups": {
+  "HK": {
+    "BABA": {
+      "code": "09988",
+      "market": "hk"
+    }
+  },
+  "US": {
+    "NVDA": {
+      "code": "NVDA",
+      "market": "us",
+      "source": "alpaca"
+    }
+  }
+}
+```
+
+规则：
+
+- `_groups` 的每个 key 就是一个自选列表名称
+- `_settings.active_group` 指定当前启用的列表
+- 最多支持 6 个自选列表；如果配置超过 6 个，只读取前 6 个，后面的忽略
+- 股票模式下，鼠标悬停在任务栏控件上时，滚轮会切换到前一个 / 后一个列表
+- 股票悬浮窗顶部使用 tab 临时切换展示分组，不保存，也不改变任务栏当前列表
+- 股票编辑窗口支持新增 / 删除分组，并编辑每个分组里的股票
+- 旧格式仍兼容：如果没有 `_groups`，程序会把原来的顶层股票自动当作一个默认列表
 
 ## 单个股票字段
 
@@ -303,7 +351,3 @@ Alt+Q
 - 如果任务栏股票显示太宽，可以把 `taskbar_symbol_count` 调小。
 - 股票模式任务栏只显示简洁价格，涨跌幅放在股票悬浮窗里。
 - 股票涨跌颜色统一，不使用红绿区分。
-
-![img_1.png](img_1.png)
-
-![img.png](img.png)

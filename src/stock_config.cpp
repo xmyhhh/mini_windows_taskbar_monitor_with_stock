@@ -4,9 +4,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string_view>
 #include <algorithm>
+#include <cwchar>
 #include <cstdlib>
 
 namespace stock_taskbar_monitor {
@@ -211,17 +213,164 @@ std::string_view SerializeStockSortMode(StockSortMode mode) {
     }
 }
 
+StockTarget ParseStockTarget(const std::string& symbol_key, const std::string& object) {
+    StockTarget target;
+    target.symbol = Utf8ToWide(symbol_key);
+    target.code = Utf8ToWide(ReadStringValue(object, "code").value_or(""));
+    target.market = Utf8ToWide(ReadStringValue(object, "market").value_or("hk"));
+    target.source = Utf8ToWide(ReadStringValue(object, "source").value_or(""));
+    target.alpaca_feed = Utf8ToWide(ReadStringValue(object, "alpaca_feed").value_or(""));
+    target.adr_factor = ReadDoubleValue(object, "adr_factor").value_or(1.0);
+    target.show_usd = ReadBoolValue(object, "show_usd").value_or(false);
+    target.min_price = ReadDoubleValue(object, "min_price");
+    target.max_price = ReadDoubleValue(object, "max_price");
+    return target;
+}
+
+void AssignDefaultGroups(AppConfig& config) {
+    config.active_group = L"Default";
+    config.stock_groups = {{config.active_group, config.stocks}};
+}
+
+std::vector<StockTarget> ParseStocksFromContainer(const std::string& content,
+                                                  bool skip_reserved_keys) {
+    std::vector<StockTarget> stocks;
+    size_t pos = 0;
+    while (true) {
+        pos = content.find('"', pos);
+        if (pos == std::string::npos) {
+            break;
+        }
+        const size_t key_end = content.find('"', pos + 1);
+        if (key_end == std::string::npos) {
+            break;
+        }
+        const std::string symbol = content.substr(pos + 1, key_end - pos - 1);
+        pos = SkipWhitespace(content, key_end + 1);
+        if (pos >= content.size() || content[pos] != ':') {
+            continue;
+        }
+        pos = SkipWhitespace(content, pos + 1);
+        if (pos >= content.size() || content[pos] != '{') {
+            continue;
+        }
+        const size_t object_end = FindMatchingBrace(content, pos);
+        if (object_end == std::string::npos) {
+            break;
+        }
+        const std::string object = content.substr(pos, object_end - pos + 1);
+        pos = object_end + 1;
+
+        if (skip_reserved_keys && (symbol == "_settings" || symbol == "_groups")) {
+            continue;
+        }
+        auto code = ReadStringValue(object, "code");
+        if (!code || code->empty()) {
+            continue;
+        }
+        stocks.push_back(ParseStockTarget(symbol, object));
+    }
+    return stocks;
+}
+
+std::vector<StockGroup> ParseStockGroupsFromObject(const std::string& groups_object) {
+    std::vector<StockGroup> groups;
+    size_t pos = 0;
+    while (true) {
+        pos = groups_object.find('"', pos);
+        if (pos == std::string::npos) {
+            break;
+        }
+        const size_t key_end = groups_object.find('"', pos + 1);
+        if (key_end == std::string::npos) {
+            break;
+        }
+        const std::string group_name = groups_object.substr(pos + 1, key_end - pos - 1);
+        pos = SkipWhitespace(groups_object, key_end + 1);
+        if (pos >= groups_object.size() || groups_object[pos] != ':') {
+            continue;
+        }
+        pos = SkipWhitespace(groups_object, pos + 1);
+        if (pos >= groups_object.size() || groups_object[pos] != '{') {
+            continue;
+        }
+        const size_t object_end = FindMatchingBrace(groups_object, pos);
+        if (object_end == std::string::npos) {
+            break;
+        }
+        const std::string object = groups_object.substr(pos, object_end - pos + 1);
+        pos = object_end + 1;
+
+        StockGroup group;
+        group.name = Utf8ToWide(group_name);
+        group.stocks = ParseStocksFromContainer(object, false);
+        if (!group.name.empty() && !group.stocks.empty()) {
+            groups.push_back(std::move(group));
+            if (groups.size() >= kMaxStockGroups) {
+                break;
+            }
+        }
+    }
+    return groups;
+}
+
+void TrimStockGroups(AppConfig& config) {
+    if (config.stock_groups.size() > kMaxStockGroups) {
+        config.stock_groups.resize(kMaxStockGroups);
+    }
+}
+
+void ActivateConfiguredGroup(AppConfig& config) {
+    TrimStockGroups(config);
+    if (config.stock_groups.empty()) {
+        AssignDefaultGroups(config);
+        return;
+    }
+
+    if (config.active_group.empty()) {
+        config.active_group = config.stock_groups.front().name;
+    }
+
+    auto active_group = std::find_if(config.stock_groups.begin(),
+                                     config.stock_groups.end(),
+                                     [&config](const StockGroup& group) {
+                                         return _wcsicmp(group.name.c_str(),
+                                                         config.active_group.c_str()) == 0;
+                                     });
+    if (active_group == config.stock_groups.end()) {
+        active_group = config.stock_groups.begin();
+        config.active_group = active_group->name;
+    }
+    config.stocks = active_group->stocks;
+}
+
 AppConfig DefaultConfig() {
     AppConfig config;
-    config.stocks = {
+    StockGroup hk_group;
+    hk_group.name = L"HK";
+    hk_group.stocks = {
         {L"POP", L"09992", L"hk", L"", L"", 1.0, false, 255.0, 260.0},
         {L"JD", L"09618", L"hk", L"", L"", 2.0, true, 134.0, 142.0},
         {L"BABA", L"09988", L"hk", L"", L"", 8.0, true, 170.0, 175.0},
         {L"Nio", L"09866", L"hk", L"", L"", 1.0, true, 52.0, 58.0},
         {L"XM", L"01810", L"hk", L"", L"", 1.0, false, std::nullopt, 56.5},
+    };
+
+    StockGroup cn_group;
+    cn_group.name = L"CN";
+    cn_group.stocks = {
         {L"PINGAN", L"000001", L"cn", L"", L"", 1.0, false, std::nullopt, std::nullopt},
+    };
+
+    StockGroup us_group;
+    us_group.name = L"US";
+    us_group.stocks = {
         {L"NVDA", L"NVDA", L"us", L"alpaca", L"", 1.0, false, std::nullopt, std::nullopt},
     };
+
+    config.active_group = hk_group.name;
+    config.stock_groups = {hk_group, cn_group, us_group};
+    config.stocks = hk_group.stocks;
     return config;
 }
 
@@ -284,6 +433,8 @@ AppConfig LoadOrCreateConfig() {
             ReadStringValue(*settings, "popup_activation_mode").value_or("hover"));
         config.sort_mode =
             ParseStockSortMode(ReadStringValue(*settings, "sort_mode").value_or("config"));
+        config.active_group =
+            Utf8ToWide(ReadStringValue(*settings, "active_group").value_or(""));
         if (auto count = ReadDoubleValue(*settings, "taskbar_symbol_count")) {
             const unsigned int requested = static_cast<unsigned int>(*count);
             if (requested == 2 || requested == 4 || requested == 6 || requested == 8) {
@@ -292,60 +443,52 @@ AppConfig LoadOrCreateConfig() {
         }
     }
 
-    size_t pos = 0;
-    while (true) {
-        pos = content.find('"', pos);
-        if (pos == std::string::npos) {
-            break;
+    if (auto groups = ExtractObjectForKey(content, "_groups")) {
+        config.stock_groups = ParseStockGroupsFromObject(*groups);
+    }
+    if (config.stock_groups.empty()) {
+        config.stocks = ParseStocksFromContainer(content, true);
+        if (!config.stocks.empty()) {
+            AssignDefaultGroups(config);
         }
-        const size_t key_end = content.find('"', pos + 1);
-        if (key_end == std::string::npos) {
-            break;
-        }
-        const std::string symbol = content.substr(pos + 1, key_end - pos - 1);
-        pos = SkipWhitespace(content, key_end + 1);
-        if (pos >= content.size() || content[pos] != ':') {
-            continue;
-        }
-        pos = SkipWhitespace(content, pos + 1);
-        if (pos >= content.size() || content[pos] != '{') {
-            continue;
-        }
-        const size_t object_end = FindMatchingBrace(content, pos);
-        if (object_end == std::string::npos) {
-            break;
-        }
-        const std::string object = content.substr(pos, object_end - pos + 1);
-        pos = object_end + 1;
-
-        if (symbol == "_settings") {
-            continue;
-        }
-        auto code = ReadStringValue(object, "code");
-        if (!code || code->empty()) {
-            continue;
-        }
-
-        StockTarget target;
-        target.symbol = Utf8ToWide(symbol);
-        target.code = Utf8ToWide(*code);
-        target.market = Utf8ToWide(ReadStringValue(object, "market").value_or("hk"));
-        target.source = Utf8ToWide(ReadStringValue(object, "source").value_or(""));
-        target.alpaca_feed = Utf8ToWide(ReadStringValue(object, "alpaca_feed").value_or(""));
-        target.adr_factor = ReadDoubleValue(object, "adr_factor").value_or(1.0);
-        target.show_usd = ReadBoolValue(object, "show_usd").value_or(false);
-        target.min_price = ReadDoubleValue(object, "min_price");
-        target.max_price = ReadDoubleValue(object, "max_price");
-        config.stocks.push_back(target);
+    } else {
+        ActivateConfiguredGroup(config);
     }
 
-    if (config.stocks.empty()) {
+    if (config.stocks.empty() && config.stock_groups.empty()) {
         return DefaultConfig();
+    }
+    if (config.stock_groups.empty()) {
+        AssignDefaultGroups(config);
+    } else if (config.stocks.empty()) {
+        ActivateConfiguredGroup(config);
     }
     return config;
 }
 
 bool SaveConfig(const AppConfig& config) {
+    AppConfig normalized = config;
+    if (normalized.stock_groups.empty()) {
+        AssignDefaultGroups(normalized);
+    }
+    TrimStockGroups(normalized);
+    if (normalized.active_group.empty()) {
+        normalized.active_group = normalized.stock_groups.front().name;
+    }
+
+    auto active_group = std::find_if(normalized.stock_groups.begin(),
+                                     normalized.stock_groups.end(),
+                                     [&normalized](const StockGroup& group) {
+                                         return _wcsicmp(group.name.c_str(),
+                                                         normalized.active_group.c_str()) == 0;
+                                     });
+    if (active_group == normalized.stock_groups.end()) {
+        normalized.active_group = normalized.stock_groups.front().name;
+        normalized.stocks = normalized.stock_groups.front().stocks;
+    } else {
+        active_group->stocks = normalized.stocks;
+    }
+
     const std::filesystem::path path(GetConfigPath());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -354,37 +497,65 @@ bool SaveConfig(const AppConfig& config) {
 
     output << "{\n";
     output << "  \"_settings\": {\n";
-    output << "    \"sample_interval_seconds\": " << config.sample_interval_seconds << ",\n";
-    output << "    \"usd_hkd_rate\": " << config.usd_hkd_rate << ",\n";
-    output << "    \"alpaca_endpoint\": \"" << WideToUtf8(config.alpaca_endpoint) << "\",\n";
-    output << "    \"alpaca_key\": \"" << WideToUtf8(config.alpaca_key_id) << "\",\n";
-    output << "    \"alpaca_secret_key\": \"" << WideToUtf8(config.alpaca_secret_key) << "\",\n";
-    output << "    \"alpaca_feed\": \"" << WideToUtf8(config.alpaca_feed) << "\",\n";
+    output << "    \"sample_interval_seconds\": " << normalized.sample_interval_seconds << ",\n";
+    output << "    \"usd_hkd_rate\": " << normalized.usd_hkd_rate << ",\n";
+    output << "    \"alpaca_endpoint\": \"" << WideToUtf8(normalized.alpaca_endpoint) << "\",\n";
+    output << "    \"alpaca_key\": \"" << WideToUtf8(normalized.alpaca_key_id) << "\",\n";
+    output << "    \"alpaca_secret_key\": \"" << WideToUtf8(normalized.alpaca_secret_key) << "\",\n";
+    output << "    \"alpaca_feed\": \"" << WideToUtf8(normalized.alpaca_feed) << "\",\n";
     output << "    \"popup_activation_mode\": \""
-           << SerializePopupActivationMode(config.popup_activation_mode) << "\",\n";
-    output << "    \"taskbar_symbol_count\": " << config.taskbar_symbol_count << ",\n";
-    output << "    \"sort_mode\": \"" << SerializeStockSortMode(config.sort_mode) << "\"\n";
-    output << "  }";
-    for (const auto& stock : config.stocks) {
-        output << ",\n  \"" << WideToUtf8(stock.symbol) << "\": {\n";
-        output << "    \"code\": \"" << WideToUtf8(stock.code) << "\",\n";
-        output << "    \"market\": \"" << WideToUtf8(stock.market) << "\",\n";
-        if (!stock.source.empty()) {
-            output << "    \"source\": \"" << WideToUtf8(stock.source) << "\",\n";
+           << SerializePopupActivationMode(normalized.popup_activation_mode) << "\",\n";
+    output << "    \"taskbar_symbol_count\": " << normalized.taskbar_symbol_count << ",\n";
+    output << "    \"sort_mode\": \"" << SerializeStockSortMode(normalized.sort_mode) << "\",\n";
+    output << "    \"active_group\": \"" << WideToUtf8(normalized.active_group) << "\"\n";
+    output << "  },\n";
+    output << "  \"_groups\": {";
+
+    bool first_group = true;
+    for (const auto& group : normalized.stock_groups) {
+        if (group.name.empty()) {
+            continue;
         }
-        if (!stock.alpaca_feed.empty()) {
-            output << "    \"alpaca_feed\": \"" << WideToUtf8(stock.alpaca_feed) << "\",\n";
+        output << (first_group ? "\n" : ",\n");
+        first_group = false;
+        output << "    \"" << WideToUtf8(group.name) << "\": {";
+
+        bool first_stock = true;
+        for (const auto& stock : group.stocks) {
+            if (stock.symbol.empty() || stock.code.empty()) {
+                continue;
+            }
+            output << (first_stock ? "\n" : ",\n");
+            first_stock = false;
+            output << "      \"" << WideToUtf8(stock.symbol) << "\": {\n";
+            output << "        \"code\": \"" << WideToUtf8(stock.code) << "\",\n";
+            output << "        \"market\": \"" << WideToUtf8(stock.market) << "\",\n";
+            if (!stock.source.empty()) {
+                output << "        \"source\": \"" << WideToUtf8(stock.source) << "\",\n";
+            }
+            if (!stock.alpaca_feed.empty()) {
+                output << "        \"alpaca_feed\": \"" << WideToUtf8(stock.alpaca_feed) << "\",\n";
+            }
+            output << "        \"adr_factor\": " << stock.adr_factor << ",\n";
+            output << "        \"show_usd\": " << (stock.show_usd ? "true" : "false");
+            if (stock.min_price) {
+                output << ",\n        \"min_price\": " << *stock.min_price;
+            }
+            if (stock.max_price) {
+                output << ",\n        \"max_price\": " << *stock.max_price;
+            }
+            output << "\n      }";
         }
-        output << "    \"adr_factor\": " << stock.adr_factor << ",\n";
-        output << "    \"show_usd\": " << (stock.show_usd ? "true" : "false");
-        if (stock.min_price) {
-            output << ",\n    \"min_price\": " << *stock.min_price;
+
+        if (!first_stock) {
+            output << "\n";
         }
-        if (stock.max_price) {
-            output << ",\n    \"max_price\": " << *stock.max_price;
-        }
-        output << "\n  }";
+        output << "    }";
     }
+    if (!first_group) {
+        output << "\n";
+    }
+    output << "  }\n";
     output << "\n}\n";
     return true;
 }
