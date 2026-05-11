@@ -92,6 +92,8 @@ constexpr UINT kMetricDownloadCommandId = 1104;
 constexpr UINT kMetricGpuCommandId = 1105;
 constexpr UINT kMetricDiskReadCommandId = 1106;
 constexpr UINT kMetricDiskWriteCommandId = 1107;
+constexpr UINT kMonitorCommandBaseId = 1200;
+constexpr UINT kMonitorCommandMaxId = 1299;
 constexpr wchar_t kRunRegistryPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"MinimalTaskbarMonitor";
 constexpr int kHoverPopupMaxVisibleRows = 14;
@@ -736,6 +738,7 @@ private:
         if (!EnsureWidgetWindow()) {
             return false;
         }
+        embedder_.SetTargetMonitorIndex(app_config_.taskbar_monitor_index);
         RefreshFontAndSize();
 
         ReattachWidget();
@@ -904,18 +907,31 @@ private:
         }
     }
 
-    void ReattachWidget() {
+    void ReattachWidget(bool recreate_widget = false) {
         HideHoverPopup();
+        if (recreate_widget && widget_window_ != nullptr && IsWindow(widget_window_)) {
+            HWND old_widget_window = widget_window_;
+            widget_window_ = nullptr;
+            embedder_.Detach(old_widget_window);
+            DestroyWindow(old_widget_window);
+        }
         if (!EnsureWidgetWindow()) {
             SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
             return;
         }
 
         embedder_.Detach(widget_window_);
+        embedder_.SetTargetMonitorIndex(app_config_.taskbar_monitor_index);
         if (!embedder_.Attach(widget_window_)) {
-            ShowWindow(widget_window_, SW_HIDE);
-            SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
-            return;
+            if (widget_window_ != nullptr && IsWindow(widget_window_)) {
+                DestroyWindow(widget_window_);
+                widget_window_ = nullptr;
+            }
+            if (!EnsureWidgetWindow() || !embedder_.Attach(widget_window_)) {
+                ShowWindow(widget_window_, SW_HIDE);
+                SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
+                return;
+            }
         }
 
         RefreshFontAndSize();
@@ -3791,6 +3807,51 @@ private:
         return true;
     }
 
+    bool SetTaskbarMonitorIndex(unsigned int monitor_index) {
+        const std::vector<TaskbarDisplayInfo> displays = TaskbarEmbedder::EnumerateDisplays();
+        const auto display = std::find_if(displays.begin(),
+                                          displays.end(),
+                                          [monitor_index](const TaskbarDisplayInfo& item) {
+                                              return item.index == monitor_index;
+                                          });
+        if (display == displays.end() || !display->has_taskbar) {
+            MessageBoxW(controller_window_,
+                        Text(L"The selected display does not have an available taskbar.",
+                             L"所选显示器没有可用任务栏。"),
+                        AppTitle(),
+                        MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        if (app_config_.taskbar_monitor_index == monitor_index) {
+            return true;
+        }
+
+        const unsigned int previous_index = app_config_.taskbar_monitor_index;
+        app_config_.taskbar_monitor_index = monitor_index;
+        if (!SaveConfig()) {
+            app_config_.taskbar_monitor_index = previous_index;
+            MessageBoxW(controller_window_,
+                        ConfigSaveErrorText(),
+                        AppTitle(),
+                        MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        ReattachWidget(true);
+        if (!embedder_.IsAttached()) {
+            app_config_.taskbar_monitor_index = previous_index;
+            SaveConfig();
+            ReattachWidget(true);
+            MessageBoxW(controller_window_,
+                        Text(L"Unable to move the widget to the selected display.",
+                             L"无法将窗口移动到所选显示器。"),
+                        AppTitle(),
+                        MB_OK | MB_ICONWARNING);
+        }
+        return true;
+    }
+
     void HandleWidgetLeftButtonDown() {
         click_popup_started_from_widget_ =
             app_config_.popup_activation_mode == PopupActivationMode::kClick && hover_popup_visible_;
@@ -3875,6 +3936,7 @@ private:
         HMENU network_units_menu = CreatePopupMenu();
         HMENU popup_mode_menu = CreatePopupMenu();
         HMENU refresh_interval_menu = CreatePopupMenu();
+        HMENU monitor_menu = CreatePopupMenu();
         HMENU stock_symbol_count_menu = CreatePopupMenu();
         HMENU stock_sort_menu = CreatePopupMenu();
         HMENU hotkey_menu = CreatePopupMenu();
@@ -3960,6 +4022,33 @@ private:
                         (app_config_.sample_interval_seconds == 10 ? MF_CHECKED : MF_UNCHECKED),
                     kSampleInterval10sCommandId,
                     Text(L"10 seconds", L"10 秒"));
+
+        const std::vector<TaskbarDisplayInfo> displays = TaskbarEmbedder::EnumerateDisplays();
+        for (size_t i = 0; i < displays.size() && i < 100; ++i) {
+            const TaskbarDisplayInfo& display = displays[i];
+            std::wstring label =
+                Text(L"Monitor ", L"显示器 ") + std::to_wstring(display.index + 1);
+            if (display.primary) {
+                label += Text(L" (Primary)", L"（主屏）");
+            }
+            if (!display.has_taskbar) {
+                label += Text(L" (No taskbar)", L"（无任务栏）");
+            }
+            const UINT flags = MF_STRING |
+                               (display.has_taskbar ? MF_ENABLED : MF_GRAYED) |
+                               (app_config_.taskbar_monitor_index == display.index ? MF_CHECKED
+                                                                                   : MF_UNCHECKED);
+            AppendMenuW(monitor_menu,
+                        flags,
+                        kMonitorCommandBaseId + static_cast<UINT>(display.index),
+                        label.c_str());
+        }
+        if (displays.empty()) {
+            AppendMenuW(monitor_menu,
+                        MF_STRING | MF_GRAYED,
+                        kMonitorCommandBaseId,
+                        Text(L"No display detected", L"未检测到显示器"));
+        }
 
         AppendMenuW(stock_symbol_count_menu,
                     MF_STRING |
@@ -4098,6 +4187,10 @@ private:
                     MF_POPUP,
                     reinterpret_cast<UINT_PTR>(language_menu),
                     Text(L"Language", L"语言"));
+        AppendMenuW(menu,
+                    MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(monitor_menu),
+                    Text(L"Display", L"显示器"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         const UINT auto_start_flags =
             MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
@@ -4215,6 +4308,10 @@ private:
         }
         if (command == kSampleInterval10sCommandId) {
             SetSampleIntervalSeconds(10);
+            return;
+        }
+        if (command >= kMonitorCommandBaseId && command <= kMonitorCommandMaxId) {
+            SetTaskbarMonitorIndex(command - kMonitorCommandBaseId);
             return;
         }
         if (command == kAutoStartCommandId) {

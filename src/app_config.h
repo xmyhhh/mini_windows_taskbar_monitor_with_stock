@@ -30,6 +30,7 @@ struct AppConfig {
     ToggleHotkey toggle_hotkey{ToggleHotkey::kAltQ};
     UiLanguage language{UiLanguage::kEnglish};
     unsigned int sample_interval_seconds{1};
+    unsigned int taskbar_monitor_index{0};
 };
 
 AppConfig LoadAppConfig();

@@ -271,6 +271,8 @@ AppConfig LoadAppConfig() {
     config.language = ParseUiLanguage(ReadStringValue(content, "language", "en"));
     config.sample_interval_seconds = NormalizeSampleIntervalSeconds(
         ReadUnsignedIntValue(content, "sample_interval_seconds", config.sample_interval_seconds));
+    config.taskbar_monitor_index =
+        ReadUnsignedIntValue(content, "taskbar_monitor_index", config.taskbar_monitor_index);
     return config;
 }
 
@@ -302,7 +304,8 @@ bool SaveAppConfig(const AppConfig& config) {
     content += SerializeString("language", SerializeUiLanguage(config.language)) + ",\n";
     content += SerializeUnsignedInt("sample_interval_seconds",
                                     NormalizeSampleIntervalSeconds(
-                                        config.sample_interval_seconds)) + "\n";
+                                        config.sample_interval_seconds)) + ",\n";
+    content += SerializeUnsignedInt("taskbar_monitor_index", config.taskbar_monitor_index) + "\n";
     content += "}\n";
 
     HANDLE file_handle =

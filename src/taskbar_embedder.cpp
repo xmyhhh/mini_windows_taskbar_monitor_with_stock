@@ -4,6 +4,7 @@
 #include <winternl.h>
 
 #include <algorithm>
+#include <vector>
 
 namespace minimal_taskbar_monitor {
 
@@ -44,14 +45,113 @@ int ScaleByDpi(UINT dpi, int value) {
     return MulDiv(value, static_cast<int>(dpi), 96);
 }
 
+BOOL CALLBACK CollectMonitorInfo(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    auto* displays = reinterpret_cast<std::vector<TaskbarDisplayInfo>*>(data);
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!GetMonitorInfoW(monitor, &monitor_info)) {
+        return TRUE;
+    }
+
+    TaskbarDisplayInfo display{};
+    display.index = static_cast<unsigned int>(displays->size());
+    display.rect = monitor_info.rcMonitor;
+    display.primary = (monitor_info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    displays->push_back(display);
+    return TRUE;
+}
+
+HMONITOR MonitorFromIndex(unsigned int target_index) {
+    struct MonitorLookup {
+        unsigned int target_index{};
+        unsigned int current_index{};
+        HMONITOR monitor{};
+    } lookup{target_index, 0, nullptr};
+
+    EnumDisplayMonitors(
+        nullptr,
+        nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+            auto* lookup = reinterpret_cast<MonitorLookup*>(data);
+            if (lookup->current_index == lookup->target_index) {
+                lookup->monitor = monitor;
+                return FALSE;
+            }
+            ++lookup->current_index;
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&lookup));
+    return lookup.monitor;
+}
+
+HMONITOR MonitorFromWindowRect(HWND window) {
+    RECT rect{};
+    if (!GetWindowRect(window, &rect)) {
+        return nullptr;
+    }
+    return MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+}
+
 }  // namespace
+
+void TaskbarEmbedder::SetTargetMonitorIndex(unsigned int monitor_index) {
+    if (target_monitor_index_ == monitor_index) {
+        return;
+    }
+    target_monitor_index_ = monitor_index;
+    mode_ = Mode::kNone;
+    taskbar_window_ = nullptr;
+    parent_window_ = nullptr;
+    task_list_window_ = nullptr;
+    tray_notify_window_ = nullptr;
+    start_button_window_ = nullptr;
+}
+
+unsigned int TaskbarEmbedder::TargetMonitorIndex() const {
+    return target_monitor_index_;
+}
+
+std::vector<TaskbarDisplayInfo> TaskbarEmbedder::EnumerateDisplays() {
+    std::vector<TaskbarDisplayInfo> displays;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorInfo, reinterpret_cast<LPARAM>(&displays));
+
+    HWND primary_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (IsWindow(primary_taskbar)) {
+        const HMONITOR monitor = MonitorFromWindowRect(primary_taskbar);
+        for (auto& display : displays) {
+            const HMONITOR display_monitor = MonitorFromRect(&display.rect, MONITOR_DEFAULTTONEAREST);
+            if (display_monitor == monitor) {
+                display.has_taskbar = true;
+                break;
+            }
+        }
+    }
+
+    HWND secondary_taskbar = nullptr;
+    while ((secondary_taskbar =
+                FindWindowExW(nullptr, secondary_taskbar, L"Shell_SecondaryTrayWnd", nullptr)) !=
+           nullptr) {
+        const HMONITOR monitor = MonitorFromWindowRect(secondary_taskbar);
+        for (auto& display : displays) {
+            const HMONITOR display_monitor = MonitorFromRect(&display.rect, MONITOR_DEFAULTTONEAREST);
+            if (display_monitor == monitor) {
+                display.has_taskbar = true;
+                break;
+            }
+        }
+    }
+
+    return displays;
+}
 
 bool TaskbarEmbedder::Attach(HWND widget_window) {
     if (widget_window == nullptr) {
         return false;
     }
 
-    Detach(widget_window);
+    if (IsAttached() || GetParent(widget_window) != nullptr) {
+        Detach(widget_window);
+    }
 
     if (!ResolveHandles()) {
         return false;
@@ -143,7 +243,9 @@ bool TaskbarEmbedder::IsAttached() const {
 }
 
 bool TaskbarEmbedder::ResolveHandles() {
-    taskbar_window_ = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!ResolveTaskbarForTargetMonitor()) {
+        taskbar_window_ = FindWindowW(L"Shell_TrayWnd", nullptr);
+    }
     if (!IsHandleAlive(taskbar_window_)) {
         return false;
     }
@@ -154,7 +256,44 @@ bool TaskbarEmbedder::ResolveHandles() {
     return ResolveClassicHandles();
 }
 
+bool TaskbarEmbedder::ResolveTaskbarForTargetMonitor() {
+    HMONITOR target_monitor = MonitorFromIndex(target_monitor_index_);
+    if (target_monitor == nullptr) {
+        target_monitor = MonitorFromIndex(0);
+    }
+    if (target_monitor == nullptr) {
+        return false;
+    }
+    return FindTaskbarForMonitor(target_monitor);
+}
+
+bool TaskbarEmbedder::FindTaskbarForMonitor(HMONITOR monitor) {
+    taskbar_window_ = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (IsHandleAlive(taskbar_window_) && MonitorFromWindowRect(taskbar_window_) == monitor) {
+        return true;
+    }
+
+    HWND secondary_taskbar = nullptr;
+    while ((secondary_taskbar =
+                FindWindowExW(nullptr, secondary_taskbar, L"Shell_SecondaryTrayWnd", nullptr)) !=
+           nullptr) {
+        if (IsHandleAlive(secondary_taskbar) && MonitorFromWindowRect(secondary_taskbar) == monitor) {
+            taskbar_window_ = secondary_taskbar;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool TaskbarEmbedder::ResolveClassicHandles() {
+    if (!IsPrimaryTaskbar()) {
+        parent_window_ = taskbar_window_;
+        task_list_window_ = nullptr;
+        tray_notify_window_ = FindWindowExW(taskbar_window_, nullptr, L"TrayNotifyWnd", nullptr);
+        mode_ = Mode::kWin11;
+        return IsHandleAlive(parent_window_);
+    }
+
     parent_window_ = FindWindowExW(taskbar_window_, nullptr, L"ReBarWindow32", nullptr);
     if (!IsHandleAlive(parent_window_)) {
         parent_window_ = FindWindowExW(taskbar_window_, nullptr, L"WorkerW", nullptr);
@@ -179,6 +318,11 @@ bool TaskbarEmbedder::ResolveWin11Handles() {
     start_button_window_ = FindWindowExW(taskbar_window_, nullptr, L"Start", nullptr);
     mode_ = Mode::kWin11;
     return true;
+}
+
+bool TaskbarEmbedder::IsPrimaryTaskbar() const {
+    HWND primary_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    return IsHandleAlive(taskbar_window_) && taskbar_window_ == primary_taskbar;
 }
 
 bool TaskbarEmbedder::LayoutClassic(HWND widget_window,
@@ -286,17 +430,32 @@ bool TaskbarEmbedder::LayoutNearTray(HWND widget_window, const SIZE& desired_siz
     const int desired_width = static_cast<int>(desired_size.cx);
     const int desired_height = static_cast<int>(desired_size.cy);
     const int margin = std::max(ScaleByDpi(CurrentDpi(), 4), 2);
+    const UINT taskbar_edge = QueryTaskbarEdge();
 
-    int x = taskbar_width - desired_width - margin - static_cast<int>(CurrentDpi() * 0.9);
-    if (IsHandleAlive(tray_notify_window_)) {
-        RECT tray_rect{};
-        if (GetWindowRect(tray_notify_window_, &tray_rect)) {
-            x = tray_rect.left - taskbar_rect.left - desired_width - margin;
+    int x = 0;
+    int y = 0;
+    if (taskbar_edge == ABE_LEFT || taskbar_edge == ABE_RIGHT) {
+        x = std::max<int>(0, (taskbar_width - desired_width) / 2);
+        y = taskbar_height - desired_height - margin;
+        if (IsHandleAlive(tray_notify_window_)) {
+            RECT tray_rect{};
+            if (GetWindowRect(tray_notify_window_, &tray_rect)) {
+                y = tray_rect.top - taskbar_rect.top - desired_height - margin;
+            }
         }
+    } else {
+        x = taskbar_width - desired_width - margin - static_cast<int>(CurrentDpi() * 0.9);
+        if (IsHandleAlive(tray_notify_window_)) {
+            RECT tray_rect{};
+            if (GetWindowRect(tray_notify_window_, &tray_rect)) {
+                x = tray_rect.left - taskbar_rect.left - desired_width - margin;
+            }
+        }
+        y = std::max<int>(0, (taskbar_height - desired_height) / 2);
     }
 
-    x = std::max<int>(0, x);
-    const int y = std::max<int>(0, (taskbar_height - desired_height) / 2);
+    x = std::clamp(x, 0, std::max<int>(0, taskbar_width - desired_width));
+    y = std::clamp(y, 0, std::max<int>(0, taskbar_height - desired_height));
     SetWindowPos(widget_window,
                  HWND_TOP,
                  x,
@@ -355,6 +514,41 @@ bool TaskbarEmbedder::IsHandleAlive(HWND window_handle) const {
 }
 
 UINT TaskbarEmbedder::QueryTaskbarEdge() const {
+    if (IsHandleAlive(taskbar_window_)) {
+        RECT taskbar_rect{};
+        if (GetWindowRect(taskbar_window_, &taskbar_rect)) {
+            const HMONITOR monitor = MonitorFromRect(&taskbar_rect, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            if (GetMonitorInfoW(monitor, &monitor_info)) {
+                const RECT monitor_rect = monitor_info.rcMonitor;
+                const auto distance = [](int a, int b) {
+                    return a >= b ? a - b : b - a;
+                };
+
+                const int left_distance = distance(taskbar_rect.left, monitor_rect.left);
+                const int right_distance = distance(taskbar_rect.right, monitor_rect.right);
+                const int top_distance = distance(taskbar_rect.top, monitor_rect.top);
+                const int bottom_distance = distance(taskbar_rect.bottom, monitor_rect.bottom);
+
+                UINT edge = ABE_BOTTOM;
+                int best_distance = bottom_distance;
+                if (top_distance < best_distance) {
+                    edge = ABE_TOP;
+                    best_distance = top_distance;
+                }
+                if (left_distance < best_distance) {
+                    edge = ABE_LEFT;
+                    best_distance = left_distance;
+                }
+                if (right_distance < best_distance) {
+                    edge = ABE_RIGHT;
+                }
+                return edge;
+            }
+        }
+    }
+
     APPBARDATA appbar_data{};
     appbar_data.cbSize = sizeof(appbar_data);
     appbar_data.hWnd = taskbar_window_;

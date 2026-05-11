@@ -2,12 +2,25 @@
 
 #include <windows.h>
 
+#include <vector>
+
 namespace minimal_taskbar_monitor {
+
+struct TaskbarDisplayInfo {
+    unsigned int index{};
+    RECT rect{};
+    bool primary{};
+    bool has_taskbar{};
+};
 
 class TaskbarEmbedder {
 public:
     TaskbarEmbedder() = default;
     ~TaskbarEmbedder() = default;
+
+    void SetTargetMonitorIndex(unsigned int monitor_index);
+    unsigned int TargetMonitorIndex() const;
+    static std::vector<TaskbarDisplayInfo> EnumerateDisplays();
 
     bool Attach(HWND widget_window);
     void Detach(HWND widget_window);
@@ -23,8 +36,11 @@ private:
     };
 
     bool ResolveHandles();
+    bool ResolveTaskbarForTargetMonitor();
     bool ResolveClassicHandles();
     bool ResolveWin11Handles();
+    bool FindTaskbarForMonitor(HMONITOR monitor);
+    bool IsPrimaryTaskbar() const;
     bool LayoutClassic(HWND widget_window, const SIZE& desired_size, UINT taskbar_edge);
     bool LayoutNearTray(HWND widget_window, const SIZE& desired_size);
     void RestoreClassicReservation();
@@ -32,6 +48,7 @@ private:
     UINT QueryTaskbarEdge() const;
 
     Mode mode_{Mode::kNone};
+    unsigned int target_monitor_index_{0};
     HWND taskbar_window_{nullptr};
     HWND parent_window_{nullptr};
     HWND task_list_window_{nullptr};
