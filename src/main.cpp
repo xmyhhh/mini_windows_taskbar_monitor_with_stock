@@ -1133,6 +1133,39 @@ private:
         return rows;
     }
 
+    std::vector<StockRow> BuildWorkingStockRows(
+        const std::vector<stock_taskbar_monitor::StockTarget>& targets,
+        const std::vector<StockRow>& cached_rows) const {
+        std::vector<StockRow> rows;
+        rows.reserve(targets.size());
+        for (const auto& target : targets) {
+            const auto cached_row =
+                std::find_if(cached_rows.begin(),
+                             cached_rows.end(),
+                             [&target](const StockRow& row) {
+                                 return _wcsicmp(row.market.c_str(), target.market.c_str()) == 0 &&
+                                        _wcsicmp(row.code.c_str(), target.code.c_str()) == 0;
+                             });
+            if (cached_row != cached_rows.end()) {
+                StockRow row = *cached_row;
+                row.symbol = target.symbol;
+                row.market = target.market;
+                row.code = target.code;
+                rows.push_back(std::move(row));
+                continue;
+            }
+
+            StockRow row;
+            row.symbol = target.symbol;
+            row.market = target.market;
+            row.code = target.code;
+            row.taskbar_price_text = L"...";
+            row.price_text = row.taskbar_price_text;
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+
     void LoadCachedStockRowsForActiveGroup() {
         const auto cache_it = stock_group_rows_cache_.find(stock_config_.active_group);
         if (cache_it != stock_group_rows_cache_.end() && !cache_it->second.empty()) {
@@ -1186,42 +1219,111 @@ private:
         }
     }
 
-    void SampleStocks() {
-        stock_rows_.clear();
-        for (const auto& target : stock_config_.stocks) {
-            StockRow row;
-            row.symbol = target.symbol;
-            row.market = target.market;
-            row.code = target.code;
-            const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
-            if (!quote) {
-                row.price_text = L"(null)";
-                row.taskbar_price_text = row.price_text;
-                stock_rows_.push_back(row);
-                continue;
-            }
-
-            row.price = quote->price;
-            EvaluateStockPriceNotification(target, quote->price);
-            row.change_percent = quote->change_percent;
-            row.taskbar_price_text = FormatPriceValue(quote->price);
-            row.price_text = row.taskbar_price_text;
-            if (target.show_usd && _wcsicmp(target.market.c_str(), L"hk") == 0 &&
-                stock_config_.usd_hkd_rate > 0.0) {
-                row.price_text += L"/" +
-                                  FormatPriceValue((quote->price / stock_config_.usd_hkd_rate) *
-                                                   target.adr_factor);
-            }
-            stock_rows_.push_back(row);
+    StockRow BuildStockRow(const stock_taskbar_monitor::StockTarget& target,
+                           const std::optional<stock_taskbar_monitor::PriceQuote>& quote,
+                           bool evaluate_alerts) {
+        StockRow row;
+        row.symbol = target.symbol;
+        row.market = target.market;
+        row.code = target.code;
+        if (!quote) {
+            row.price_text = L"(null)";
+            row.taskbar_price_text = row.price_text;
+            return row;
         }
+
+        row.price = quote->price;
+        if (evaluate_alerts) {
+            EvaluateStockPriceNotification(target, quote->price);
+        }
+        row.change_percent = quote->change_percent;
+        row.taskbar_price_text = FormatPriceValue(quote->price);
+        row.price_text = row.taskbar_price_text;
+        if (target.show_usd && _wcsicmp(target.market.c_str(), L"hk") == 0 &&
+            stock_config_.usd_hkd_rate > 0.0) {
+            row.price_text += L"/" +
+                              FormatPriceValue((quote->price / stock_config_.usd_hkd_rate) *
+                                               target.adr_factor);
+        }
+        return row;
+    }
+
+    void PublishActiveStockRows(const std::vector<StockRow>& rows,
+                                bool update_timestamp,
+                                bool refresh_layout) {
+        stock_rows_ = rows;
         SortStockRows();
         stock_group_rows_cache_[stock_config_.active_group] = stock_rows_;
-        stock_last_update_time_ = FormatClockTime();
-        stock_group_last_update_time_[stock_config_.active_group] = stock_last_update_time_;
-        if (_wcsicmp(PopupStockGroupName().c_str(), stock_config_.active_group.c_str()) == 0) {
+        if (update_timestamp) {
+            stock_last_update_time_ = FormatClockTime();
+            stock_group_last_update_time_[stock_config_.active_group] = stock_last_update_time_;
+        }
+        const bool popup_shows_active_group =
+            _wcsicmp(PopupStockGroupName().c_str(), stock_config_.active_group.c_str()) == 0;
+        if (popup_shows_active_group) {
             popup_stock_rows_ = stock_rows_;
         }
+
         UpdateStockDisplayLines();
+        if (refresh_layout) {
+            RefreshWidgetLayoutAndRedraw();
+            return;
+        }
+
+        RequestWidgetRedraw();
+        if (popup_shows_active_group && hover_popup_visible_) {
+            UpdateHoverPopupScrollBar();
+            RequestHoverPopupRedraw();
+        }
+    }
+
+    void PublishPopupStockRows(const std::wstring& group_name,
+                               const std::vector<StockRow>& rows,
+                               bool update_timestamp) {
+        std::vector<StockRow> sorted_rows = rows;
+        SortStockRows(sorted_rows);
+        stock_group_rows_cache_[group_name] = sorted_rows;
+        if (update_timestamp) {
+            stock_group_last_update_time_[group_name] = FormatClockTime();
+        }
+
+        const bool popup_shows_group =
+            _wcsicmp(PopupStockGroupName().c_str(), group_name.c_str()) == 0;
+        if (popup_shows_group) {
+            popup_stock_rows_ = sorted_rows;
+            UpdateHoverPopupScrollBar();
+            RequestHoverPopupRedraw();
+        }
+
+        if (_wcsicmp(stock_config_.active_group.c_str(), group_name.c_str()) == 0) {
+            stock_rows_ = std::move(sorted_rows);
+            if (update_timestamp) {
+                stock_last_update_time_ = stock_group_last_update_time_[group_name];
+            }
+            UpdateStockDisplayLines();
+            RequestWidgetRedraw();
+        }
+    }
+
+    void SampleStocks() {
+        std::vector<StockRow> cached_rows = stock_rows_;
+        const auto cache_it = stock_group_rows_cache_.find(stock_config_.active_group);
+        if (cache_it != stock_group_rows_cache_.end() && !cache_it->second.empty()) {
+            cached_rows = cache_it->second;
+        }
+        std::vector<StockRow> rows = BuildWorkingStockRows(stock_config_.stocks, cached_rows);
+        PublishActiveStockRows(rows, false, true);
+
+        for (size_t index = 0; index < stock_config_.stocks.size(); ++index) {
+            const auto& target = stock_config_.stocks[index];
+            const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
+            if (index < rows.size()) {
+                rows[index] = BuildStockRow(target, quote, true);
+                PublishActiveStockRows(rows, true, false);
+            }
+        }
+
+        PublishActiveStockRows(rows, !rows.empty(), true);
     }
 
     void ResetPopupStockGroupToTaskbarGroup() {
@@ -1250,37 +1352,24 @@ private:
             return;
         }
 
-        std::vector<StockRow> rows;
-        rows.reserve(group->stocks.size());
-        for (const auto& target : group->stocks) {
-            StockRow row;
-            row.symbol = target.symbol;
-            row.market = target.market;
-            row.code = target.code;
-            const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
-            if (!quote) {
-                row.price_text = L"(null)";
-                row.taskbar_price_text = row.price_text;
-                rows.push_back(std::move(row));
-                continue;
-            }
-
-            row.price = quote->price;
-            row.change_percent = quote->change_percent;
-            row.taskbar_price_text = FormatPriceValue(quote->price);
-            row.price_text = row.taskbar_price_text;
-            if (target.show_usd && _wcsicmp(target.market.c_str(), L"hk") == 0 &&
-                stock_config_.usd_hkd_rate > 0.0) {
-                row.price_text += L"/" +
-                                  FormatPriceValue((quote->price / stock_config_.usd_hkd_rate) *
-                                                   target.adr_factor);
-            }
-            rows.push_back(std::move(row));
+        std::vector<StockRow> cached_rows;
+        const auto cache_it = stock_group_rows_cache_.find(group_name);
+        if (cache_it != stock_group_rows_cache_.end() && !cache_it->second.empty()) {
+            cached_rows = cache_it->second;
+        } else if (_wcsicmp(PopupStockGroupName().c_str(), group_name.c_str()) == 0) {
+            cached_rows = popup_stock_rows_;
         }
-        SortStockRows(rows);
-        popup_stock_rows_ = rows;
-        stock_group_rows_cache_[group_name] = popup_stock_rows_;
-        stock_group_last_update_time_[group_name] = FormatClockTime();
+        std::vector<StockRow> rows = BuildWorkingStockRows(group->stocks, cached_rows);
+        PublishPopupStockRows(group_name, rows, false);
+
+        for (size_t index = 0; index < group->stocks.size(); ++index) {
+            const auto& target = group->stocks[index];
+            const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
+            if (index < rows.size()) {
+                rows[index] = BuildStockRow(target, quote, false);
+                PublishPopupStockRows(group_name, rows, true);
+            }
+        }
     }
 
     void SetPopupStockGroupIndex(int index) {
@@ -3074,7 +3163,6 @@ private:
     void SampleAndRefresh() {
         if (stock_mode_) {
             SampleStocks();
-            RefreshWidgetLayoutAndRedraw();
             return;
         }
 
@@ -3114,6 +3202,7 @@ private:
                      nullptr);
             SilenceStockNotificationsForSwitch();
             SampleStocks();
+            return;
         } else {
             FlushDeferredStockConfigSave();
             SetTimer(controller_window_,
@@ -3143,8 +3232,9 @@ private:
             SampleStocks();
             if (hover_popup_visible_) {
                 ResetPopupStockGroupToTaskbarGroup();
+                UpdateHoverPopupScrollBar();
+                RequestHoverPopupRedraw();
             }
-            RefreshWidgetLayoutAndRedraw();
         }
     }
 
@@ -3163,8 +3253,9 @@ private:
             SampleStocks();
             if (hover_popup_visible_) {
                 ResetPopupStockGroupToTaskbarGroup();
+                UpdateHoverPopupScrollBar();
+                RequestHoverPopupRedraw();
             }
-            RefreshWidgetLayoutAndRedraw();
         }
     }
 
