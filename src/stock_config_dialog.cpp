@@ -23,6 +23,7 @@ enum ControlId {
     kGroupNameEditId = 7106,
     kAddGroupButtonId = 7107,
     kRemoveGroupButtonId = 7108,
+    kSortModeComboId = 7109,
     kStockListId = 7110,
     kSymbolEditId = 7111,
     kCodeEditId = 7112,
@@ -34,6 +35,8 @@ enum ControlId {
     kMaxPriceEditId = 7118,
     kMinPriceEnableId = 7119,
     kMaxPriceEnableId = 7120,
+    kMoveStockUpButtonId = 7121,
+    kMoveStockDownButtonId = 7122,
     kSaveButtonId = 7201,
     kCancelButtonId = 7202,
 };
@@ -48,6 +51,7 @@ struct DialogState {
     HWND group_name{};
     HWND add_group{};
     HWND remove_group{};
+    HWND sort_mode{};
     HWND stock_list{};
     HWND symbol{};
     HWND code{};
@@ -59,6 +63,8 @@ struct DialogState {
     HWND max_price{};
     HWND add_stock{};
     HWND remove_stock{};
+    HWND move_stock_up{};
+    HWND move_stock_down{};
     HWND save{};
     HWND cancel{};
     HFONT font{};
@@ -332,6 +338,42 @@ void SelectAlpacaFeed(HWND combo, const std::wstring& feed) {
     ComboBox_SetCurSel(combo, 1);
 }
 
+void PopulateSortModeCombo(HWND combo, bool chinese) {
+    ComboBox_AddString(combo, Text(chinese, L"Config order", L"配置顺序"));
+    ComboBox_AddString(combo, Text(chinese, L"Top gainers", L"涨幅优先"));
+    ComboBox_AddString(combo, Text(chinese, L"Top losers", L"跌幅优先"));
+    ComboBox_SetCurSel(combo, 0);
+}
+
+void SelectSortMode(HWND combo, StockSortMode sort_mode) {
+    int index = 0;
+    switch (sort_mode) {
+    case StockSortMode::kTopGainers:
+        index = 1;
+        break;
+    case StockSortMode::kTopLosers:
+        index = 2;
+        break;
+    case StockSortMode::kConfigOrder:
+    default:
+        index = 0;
+        break;
+    }
+    ComboBox_SetCurSel(combo, index);
+}
+
+StockSortMode GetSelectedSortMode(HWND combo) {
+    switch (ComboBox_GetCurSel(combo)) {
+    case 1:
+        return StockSortMode::kTopGainers;
+    case 2:
+        return StockSortMode::kTopLosers;
+    case 0:
+    default:
+        return StockSortMode::kConfigOrder;
+    }
+}
+
 std::wstring StockListLabel(const StockTarget& stock) {
     std::wstring label = stock.symbol;
     label += L"    ";
@@ -409,6 +451,13 @@ void RefreshStockList(DialogState& state) {
     } else {
         state.selected_stock = -1;
     }
+    const bool has_selection = state.selected_stock >= 0;
+    EnableWindow(state.remove_stock, has_selection ? TRUE : FALSE);
+    EnableWindow(state.move_stock_up, has_selection && state.selected_stock > 0 ? TRUE : FALSE);
+    EnableWindow(state.move_stock_down,
+                 has_selection && state.selected_stock + 1 < static_cast<int>(state.stocks.size())
+                     ? TRUE
+                     : FALSE);
     state.syncing = false;
 }
 
@@ -427,6 +476,8 @@ void LoadSelectedStockToEditor(DialogState& state) {
         SetWindowString(state.max_price, L"");
         EnableWindow(state.max_price, FALSE);
         EnableWindow(state.remove_stock, FALSE);
+        EnableWindow(state.move_stock_up, FALSE);
+        EnableWindow(state.move_stock_down, FALSE);
         state.syncing = false;
         return;
     }
@@ -443,6 +494,9 @@ void LoadSelectedStockToEditor(DialogState& state) {
     SetWindowString(state.max_price, FormatOptionalDouble(stock.max_price));
     EnableWindow(state.max_price, stock.max_price ? TRUE : FALSE);
     EnableWindow(state.remove_stock, TRUE);
+    EnableWindow(state.move_stock_up, state.selected_stock > 0 ? TRUE : FALSE);
+    EnableWindow(state.move_stock_down,
+                 state.selected_stock + 1 < static_cast<int>(state.stocks.size()) ? TRUE : FALSE);
     state.syncing = false;
 }
 
@@ -563,11 +617,30 @@ void RemoveSelectedStock(DialogState& state) {
     LoadSelectedStockToEditor(state);
 }
 
+void MoveSelectedStock(DialogState& state, int direction) {
+    if (direction == 0 || state.selected_stock < 0 ||
+        state.selected_stock >= static_cast<int>(state.stocks.size())) {
+        return;
+    }
+    const int target_index = state.selected_stock + direction;
+    if (target_index < 0 || target_index >= static_cast<int>(state.stocks.size())) {
+        return;
+    }
+
+    CommitEditorToSelectedStock(state);
+    std::swap(state.stocks[static_cast<size_t>(state.selected_stock)],
+              state.stocks[static_cast<size_t>(target_index)]);
+    state.selected_stock = target_index;
+    RefreshStockList(state);
+    LoadSelectedStockToEditor(state);
+}
+
 void PopulateControls(DialogState& state) {
     SetWindowString(state.endpoint, state.config->alpaca_endpoint);
     SetWindowString(state.key, state.config->alpaca_key_id);
     SetWindowString(state.secret, state.config->alpaca_secret_key);
     SelectAlpacaFeed(state.feed, state.config->alpaca_feed);
+    SelectSortMode(state.sort_mode, state.config->sort_mode);
 
     state.groups = state.config->stock_groups;
     if (state.groups.size() > kMaxStockGroups) {
@@ -728,6 +801,7 @@ bool SaveControls(DialogState& state) {
     if (next.alpaca_feed.empty()) {
         next.alpaca_feed = L"iex";
     }
+    next.sort_mode = GetSelectedSortMode(state.sort_mode);
 
     CommitEditorToSelectedStock(state);
     CommitCurrentGroup(state);
@@ -803,51 +877,69 @@ void CreateDialogControls(DialogState& state) {
                                       68,
                                       28);
 
-    CreateLabel(state, Text(state.chinese, L"Stocks", L"股票"), 18, 224, 90, 22);
-    state.stock_list = CreateListBox(state, kStockListId, 18, 252, 220, 250);
+    CreateLabel(state, Text(state.chinese, L"Sort", L"排序"), 18, 224, 90, 22);
+    state.sort_mode = CreateComboBox(state, kSortModeComboId, 112, 222, 126, 120);
+    PopulateSortModeCombo(state.sort_mode, state.chinese);
+
+    CreateLabel(state, Text(state.chinese, L"Stocks", L"股票"), 18, 264, 90, 22);
+    state.stock_list = CreateListBox(state, kStockListId, 18, 292, 220, 250);
     state.add_stock = CreateButton(state,
                                    kAddStockButtonId,
                                    Text(state.chinese, L"Add", L"添加"),
                                    18,
-                                   512,
-                                   104,
+                                   552,
+                                   74,
                                    28);
     state.remove_stock = CreateButton(state,
                                       kRemoveStockButtonId,
                                       Text(state.chinese, L"Remove", L"删除"),
-                                      134,
-                                      512,
-                                      104,
+                                      92,
+                                      552,
+                                      74,
                                       28);
+    state.move_stock_up = CreateButton(state,
+                                      kMoveStockUpButtonId,
+                                      Text(state.chinese, L"Up", L"上移"),
+                                      18,
+                                      588,
+                                      74,
+                                      28);
+    state.move_stock_down = CreateButton(state,
+                                        kMoveStockDownButtonId,
+                                        Text(state.chinese, L"Down", L"下移"),
+                                        92,
+                                        588,
+                                        74,
+                                        28);
 
-    CreateLabel(state, Text(state.chinese, L"Selected Stock", L"当前股票"), 270, 252, 160, 22);
-    CreateLabel(state, Text(state.chinese, L"Name", L"名称"), 270, 288, 90, 20);
-    state.symbol = CreateEdit(state, kSymbolEditId, 370, 286, 132, 24);
-    CreateLabel(state, Text(state.chinese, L"Code", L"代码"), 270, 328, 90, 20);
-    state.code = CreateEdit(state, kCodeEditId, 370, 326, 132, 24);
-    CreateLabel(state, Text(state.chinese, L"Market", L"市场"), 270, 368, 90, 20);
-    state.market = CreateMarketCombo(state, kMarketComboId, 370, 366, 132, 160);
-    CreateLabel(state, Text(state.chinese, L"Display", L"显示"), 270, 408, 90, 20);
-    state.show_usd = CreateCheckBox(state, kShowUsdCheckId, 370, 406, 90, 24);
-    state.min_price_enabled = CreateCheckBox(state, kMinPriceEnableId, L"", 270, 448, 26, 24);
-    CreateLabel(state, Text(state.chinese, L"Low Alert", L"低价提醒"), 300, 448, 90, 20);
-    state.min_price = CreateEdit(state, kMinPriceEditId, 400, 446, 102, 24);
-    state.max_price_enabled = CreateCheckBox(state, kMaxPriceEnableId, L"", 270, 488, 26, 24);
-    CreateLabel(state, Text(state.chinese, L"High Alert", L"高价提醒"), 300, 488, 90, 20);
-    state.max_price = CreateEdit(state, kMaxPriceEditId, 400, 486, 102, 24);
+    CreateLabel(state, Text(state.chinese, L"Selected Stock", L"当前股票"), 270, 292, 160, 22);
+    CreateLabel(state, Text(state.chinese, L"Name", L"名称"), 270, 328, 90, 20);
+    state.symbol = CreateEdit(state, kSymbolEditId, 370, 326, 132, 24);
+    CreateLabel(state, Text(state.chinese, L"Code", L"代码"), 270, 368, 90, 20);
+    state.code = CreateEdit(state, kCodeEditId, 370, 366, 132, 24);
+    CreateLabel(state, Text(state.chinese, L"Market", L"市场"), 270, 408, 90, 20);
+    state.market = CreateMarketCombo(state, kMarketComboId, 370, 406, 132, 160);
+    CreateLabel(state, Text(state.chinese, L"Display", L"显示"), 270, 448, 90, 20);
+    state.show_usd = CreateCheckBox(state, kShowUsdCheckId, 370, 446, 90, 24);
+    state.min_price_enabled = CreateCheckBox(state, kMinPriceEnableId, L"", 270, 488, 26, 24);
+    CreateLabel(state, Text(state.chinese, L"Low Alert", L"低价提醒"), 300, 488, 90, 20);
+    state.min_price = CreateEdit(state, kMinPriceEditId, 400, 486, 102, 24);
+    state.max_price_enabled = CreateCheckBox(state, kMaxPriceEnableId, L"", 270, 528, 26, 24);
+    CreateLabel(state, Text(state.chinese, L"High Alert", L"高价提醒"), 300, 528, 90, 20);
+    state.max_price = CreateEdit(state, kMaxPriceEditId, 400, 526, 102, 24);
 
     state.save = CreateButton(state,
                               kSaveButtonId,
                               Text(state.chinese, L"Save", L"保存"),
                               312,
-                              560,
+                              600,
                               90,
                               30);
     state.cancel = CreateButton(state,
                                 kCancelButtonId,
                                 Text(state.chinese, L"Cancel", L"取消"),
                                 412,
-                                560,
+                                600,
                                 90,
                                 30);
     PopulateControls(state);
@@ -899,6 +991,14 @@ LRESULT CALLBACK DialogProc(HWND window, UINT message, WPARAM w_param, LPARAM l_
         }
         if (LOWORD(w_param) == kRemoveStockButtonId) {
             RemoveSelectedStock(*state);
+            return 0;
+        }
+        if (LOWORD(w_param) == kMoveStockUpButtonId) {
+            MoveSelectedStock(*state, -1);
+            return 0;
+        }
+        if (LOWORD(w_param) == kMoveStockDownButtonId) {
+            MoveSelectedStock(*state, 1);
             return 0;
         }
         if ((LOWORD(w_param) == kSymbolEditId || LOWORD(w_param) == kCodeEditId ||
@@ -994,7 +1094,7 @@ bool ShowStockConfigDialog(HWND owner,
     state.config = config;
 
     const int width = Scale(owner, 560);
-    const int height = Scale(owner, 640);
+    const int height = Scale(owner, 680);
     HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME,
                                   kDialogClassName,
                                   Text(chinese, L"Stock Config", L"股票配置"),
