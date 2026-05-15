@@ -50,6 +50,7 @@ constexpr UINT kDeferredStockSampleDelayMs = 250;
 constexpr UINT kDeferredStockConfigSaveDelayMs = 500;
 constexpr ULONGLONG kStockNotificationStartupSilenceMs = 10000;
 constexpr ULONGLONG kStockNotificationSwitchSilenceMs = 2500;
+constexpr int kStockNullFailureThreshold = 3;
 constexpr int kStockPopupVisibleRows = 10;
 constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
@@ -654,6 +655,7 @@ struct StockRow {
     std::wstring code;
     double price{0.0};
     std::optional<double> change_percent;
+    bool close_price_marker{false};
 };
 
 class MonitorApp {
@@ -1151,6 +1153,7 @@ private:
                 row.symbol = target.symbol;
                 row.market = target.market;
                 row.code = target.code;
+                ApplyClosePriceMarker(target, row);
                 rows.push_back(std::move(row));
                 continue;
             }
@@ -1219,32 +1222,169 @@ private:
         }
     }
 
+    std::wstring StockKey(const stock_taskbar_monitor::StockTarget& target) const {
+        return ToLowerCopy(target.market) + L":" + ToLowerCopy(target.code);
+    }
+
+    bool IsCnOrHkMarket(const stock_taskbar_monitor::StockTarget& target) const {
+        const std::wstring market = ToLowerCopy(target.market);
+        return market == L"cn" || market == L"hk";
+    }
+
+    bool IsTradingMinuteForMarket(const std::wstring& market,
+                                  const stock_taskbar_monitor::NetworkUtcTime& utc_time) const {
+        if (utc_time.day_of_week == 0 || utc_time.day_of_week == 6) {
+            return false;
+        }
+
+        const int local_minutes =
+            (static_cast<int>(utc_time.hour) + 8) % 24 * 60 + static_cast<int>(utc_time.minute);
+        if (market == L"hk") {
+            return (local_minutes >= 9 * 60 && local_minutes <= 12 * 60) ||
+                   (local_minutes >= 13 * 60 && local_minutes <= 16 * 60 + 10);
+        }
+        if (market == L"cn") {
+            return (local_minutes >= 9 * 60 + 15 && local_minutes <= 11 * 60 + 30) ||
+                   (local_minutes >= 13 * 60 && local_minutes <= 15 * 60);
+        }
+        return true;
+    }
+
+    bool ShouldFetchStockNow(const stock_taskbar_monitor::StockTarget& target) const {
+        if (!IsCnOrHkMarket(target)) {
+            return true;
+        }
+        const std::wstring key = StockKey(target);
+        if (!stock_initial_fetch_done_.contains(key)) {
+            return true;
+        }
+
+        const auto utc_time = stock_taskbar_monitor::GetEstimatedNetworkUtcTime();
+        if (!utc_time) {
+            return true;
+        }
+
+        return IsTradingMinuteForMarket(ToLowerCopy(target.market), *utc_time);
+    }
+
+    bool ShouldMarkClosePrice(const stock_taskbar_monitor::StockTarget& target) const {
+        if (!IsCnOrHkMarket(target)) {
+            return false;
+        }
+
+        const auto utc_time = stock_taskbar_monitor::GetEstimatedNetworkUtcTime();
+        if (!utc_time) {
+            return false;
+        }
+
+        return !IsTradingMinuteForMarket(ToLowerCopy(target.market), *utc_time);
+    }
+
+    void MarkStockFetchAttempted(const stock_taskbar_monitor::StockTarget& target) {
+        if (IsCnOrHkMarket(target)) {
+            stock_initial_fetch_done_.insert(StockKey(target));
+        }
+    }
+
+    std::wstring FormatDisplayedPriceText(const std::wstring& price_text,
+                                          bool close_price) const {
+        if (!close_price || price_text.empty() || price_text == L"..." ||
+            price_text == L"(null)") {
+            return price_text;
+        }
+        return L"C" + price_text;
+    }
+
+    void ApplyClosePriceMarker(stock_taskbar_monitor::StockTarget target, StockRow& row) const {
+        if (row.price <= 0.0) {
+            row.close_price_marker = false;
+            return;
+        }
+
+        target.market = row.market;
+        target.code = row.code;
+        const bool close_price = ShouldMarkClosePrice(target);
+        if (row.close_price_marker == close_price) {
+            return;
+        }
+
+        const std::wstring old_prefix = L"C";
+        if (row.close_price_marker) {
+            if (row.taskbar_price_text.starts_with(old_prefix)) {
+                row.taskbar_price_text.erase(0, old_prefix.size());
+            }
+            if (row.price_text.starts_with(old_prefix)) {
+                row.price_text.erase(0, old_prefix.size());
+            }
+        }
+        row.close_price_marker = close_price;
+        if (row.close_price_marker) {
+            row.taskbar_price_text = FormatDisplayedPriceText(row.taskbar_price_text, true);
+            row.price_text = FormatDisplayedPriceText(row.price_text, true);
+        }
+    }
+
+    void ApplyClosePriceMarkers(const std::vector<stock_taskbar_monitor::StockTarget>& targets,
+                                std::vector<StockRow>& rows) const {
+        for (auto& row : rows) {
+            const auto target =
+                std::find_if(targets.begin(),
+                             targets.end(),
+                             [&row](const stock_taskbar_monitor::StockTarget& candidate) {
+                                 return _wcsicmp(candidate.market.c_str(), row.market.c_str()) == 0 &&
+                                        _wcsicmp(candidate.code.c_str(), row.code.c_str()) == 0;
+                             });
+            if (target != targets.end()) {
+                ApplyClosePriceMarker(*target, row);
+            }
+        }
+    }
+
+    StockRow BuildStockFailureRow(const stock_taskbar_monitor::StockTarget& target,
+                                  const StockRow& previous_row) {
+        const std::wstring key = StockKey(target);
+        const int failure_count = ++stock_fetch_failure_counts_[key];
+        if (failure_count < kStockNullFailureThreshold) {
+            StockRow row = previous_row;
+            row.symbol = target.symbol;
+            row.market = target.market;
+            row.code = target.code;
+            ApplyClosePriceMarker(target, row);
+            return row;
+        }
+
+        StockRow row;
+        row.symbol = target.symbol;
+        row.market = target.market;
+        row.code = target.code;
+        row.price_text = L"(null)";
+        row.taskbar_price_text = row.price_text;
+        return row;
+    }
+
     StockRow BuildStockRow(const stock_taskbar_monitor::StockTarget& target,
-                           const std::optional<stock_taskbar_monitor::PriceQuote>& quote,
+                           const stock_taskbar_monitor::PriceQuote& quote,
                            bool evaluate_alerts) {
         StockRow row;
         row.symbol = target.symbol;
         row.market = target.market;
         row.code = target.code;
-        if (!quote) {
-            row.price_text = L"(null)";
-            row.taskbar_price_text = row.price_text;
-            return row;
-        }
 
-        row.price = quote->price;
+        stock_fetch_failure_counts_.erase(StockKey(target));
+        row.price = quote.price;
         if (evaluate_alerts) {
-            EvaluateStockPriceNotification(target, quote->price);
+            EvaluateStockPriceNotification(target, quote.price);
         }
-        row.change_percent = quote->change_percent;
-        row.taskbar_price_text = FormatPriceValue(quote->price);
+        row.change_percent = quote.change_percent;
+        row.taskbar_price_text = FormatPriceValue(quote.price);
         row.price_text = row.taskbar_price_text;
         if (target.show_usd && _wcsicmp(target.market.c_str(), L"hk") == 0 &&
             stock_config_.usd_hkd_rate > 0.0) {
             row.price_text += L"/" +
-                              FormatPriceValue((quote->price / stock_config_.usd_hkd_rate) *
+                              FormatPriceValue((quote.price / stock_config_.usd_hkd_rate) *
                                                target.adr_factor);
         }
+        ApplyClosePriceMarker(target, row);
         return row;
     }
 
@@ -1312,18 +1452,49 @@ private:
             cached_rows = cache_it->second;
         }
         std::vector<StockRow> rows = BuildWorkingStockRows(stock_config_.stocks, cached_rows);
+        ApplyClosePriceMarkers(stock_config_.stocks, rows);
+
+        bool has_fetchable_stock = false;
+        for (const auto& target : stock_config_.stocks) {
+            if (ShouldFetchStockNow(target)) {
+                has_fetchable_stock = true;
+                break;
+            }
+        }
+        if (!has_fetchable_stock) {
+            PublishActiveStockRows(rows, false, true);
+            return;
+        }
+
         PublishActiveStockRows(rows, false, true);
 
+        bool updated_any = false;
         for (size_t index = 0; index < stock_config_.stocks.size(); ++index) {
             const auto& target = stock_config_.stocks[index];
+            if (!ShouldFetchStockNow(target)) {
+                continue;
+            }
+            MarkStockFetchAttempted(target);
             const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
             if (index < rows.size()) {
-                rows[index] = BuildStockRow(target, quote, true);
-                PublishActiveStockRows(rows, true, false);
+                if (quote) {
+                    rows[index] = BuildStockRow(target, *quote, true);
+                    updated_any = true;
+                    PublishActiveStockRows(rows, true, false);
+                    continue;
+                }
+
+                rows[index] = BuildStockFailureRow(target, rows[index]);
+                const bool show_null =
+                    stock_fetch_failure_counts_[StockKey(target)] >= kStockNullFailureThreshold;
+                if (show_null) {
+                    updated_any = true;
+                    PublishActiveStockRows(rows, true, false);
+                }
             }
         }
 
-        PublishActiveStockRows(rows, !rows.empty(), true);
+        PublishActiveStockRows(rows, updated_any, true);
     }
 
     void ResetPopupStockGroupToTaskbarGroup() {
@@ -1360,14 +1531,42 @@ private:
             cached_rows = popup_stock_rows_;
         }
         std::vector<StockRow> rows = BuildWorkingStockRows(group->stocks, cached_rows);
+        ApplyClosePriceMarkers(group->stocks, rows);
+
+        bool has_fetchable_stock = false;
+        for (const auto& target : group->stocks) {
+            if (ShouldFetchStockNow(target)) {
+                has_fetchable_stock = true;
+                break;
+            }
+        }
+        if (!has_fetchable_stock) {
+            PublishPopupStockRows(group_name, rows, false);
+            return;
+        }
+
         PublishPopupStockRows(group_name, rows, false);
 
         for (size_t index = 0; index < group->stocks.size(); ++index) {
             const auto& target = group->stocks[index];
+            if (!ShouldFetchStockNow(target)) {
+                continue;
+            }
+            MarkStockFetchAttempted(target);
             const auto quote = stock_taskbar_monitor::FetchRealtimePrice(target, stock_config_);
             if (index < rows.size()) {
-                rows[index] = BuildStockRow(target, quote, false);
-                PublishPopupStockRows(group_name, rows, true);
+                if (quote) {
+                    rows[index] = BuildStockRow(target, *quote, false);
+                    PublishPopupStockRows(group_name, rows, true);
+                    continue;
+                }
+
+                rows[index] = BuildStockFailureRow(target, rows[index]);
+                const bool show_null =
+                    stock_fetch_failure_counts_[StockKey(target)] >= kStockNullFailureThreshold;
+                if (show_null) {
+                    PublishPopupStockRows(group_name, rows, true);
+                }
             }
         }
     }
@@ -4899,7 +5098,9 @@ private:
     std::vector<StockRow> popup_stock_rows_{};
     std::map<std::wstring, std::vector<StockRow>> stock_group_rows_cache_{};
     std::map<std::wstring, std::wstring> stock_group_last_update_time_{};
+    std::map<std::wstring, int> stock_fetch_failure_counts_{};
     std::set<std::wstring> stock_active_alerts_{};
+    std::set<std::wstring> stock_initial_fetch_done_{};
     std::vector<DisplayLines::Column> display_columns_{};
     std::vector<int> column_widths_{};
     ProcessMonitor process_monitor_{};

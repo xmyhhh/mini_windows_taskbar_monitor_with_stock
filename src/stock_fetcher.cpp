@@ -4,6 +4,7 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cwchar>
 #include <cwctype>
 #include <cstdlib>
@@ -14,6 +15,9 @@
 
 namespace stock_taskbar_monitor {
 namespace {
+
+std::atomic<unsigned long long> g_network_utc_file_time{0};
+std::atomic<unsigned long long> g_network_utc_tick_ms{0};
 
 std::wstring ToLower(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
@@ -101,6 +105,30 @@ HttpEndpoint ParseHttpEndpoint(std::wstring endpoint, const std::wstring& fallba
     return parsed;
 }
 
+void RememberNetworkDateHeader(HINTERNET request) {
+    SYSTEMTIME utc_time{};
+    DWORD buffer_length = sizeof(utc_time);
+    if (!WinHttpQueryHeaders(request,
+                             WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+                             WINHTTP_HEADER_NAME_BY_INDEX,
+                             &utc_time,
+                             &buffer_length,
+                             WINHTTP_NO_HEADER_INDEX)) {
+        return;
+    }
+
+    FILETIME file_time{};
+    if (!SystemTimeToFileTime(&utc_time, &file_time)) {
+        return;
+    }
+
+    ULARGE_INTEGER combined{};
+    combined.LowPart = file_time.dwLowDateTime;
+    combined.HighPart = file_time.dwHighDateTime;
+    g_network_utc_file_time.store(combined.QuadPart, std::memory_order_relaxed);
+    g_network_utc_tick_ms.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
 std::optional<std::string> HttpGet(const std::wstring& host,
                                    const std::wstring& path,
                                    bool https,
@@ -141,6 +169,10 @@ std::optional<std::string> HttpGet(const std::wstring& host,
                                  0,
                                  0) != FALSE &&
               WinHttpReceiveResponse(request, nullptr) != FALSE;
+
+    if (ok) {
+        RememberNetworkDateHeader(request);
+    }
 
     std::string body;
     while (ok) {
@@ -395,6 +427,37 @@ std::optional<PriceQuote> FetchRealtimePrice(const StockTarget& target, const Ap
         return FetchAlpacaPrice(target, config);
     }
     return FetchSinaPrice(target);
+}
+
+std::optional<NetworkUtcTime> GetEstimatedNetworkUtcTime() {
+    const unsigned long long file_time =
+        g_network_utc_file_time.load(std::memory_order_relaxed);
+    const unsigned long long tick_ms =
+        g_network_utc_tick_ms.load(std::memory_order_relaxed);
+    if (file_time == 0 || tick_ms == 0) {
+        return std::nullopt;
+    }
+
+    const unsigned long long elapsed_ms = GetTickCount64() - tick_ms;
+    const unsigned long long estimated_file_time = file_time + elapsed_ms * 10000ull;
+    ULARGE_INTEGER combined{};
+    combined.QuadPart = estimated_file_time;
+    FILETIME estimated{};
+    estimated.dwLowDateTime = combined.LowPart;
+    estimated.dwHighDateTime = combined.HighPart;
+
+    SYSTEMTIME utc_time{};
+    if (!FileTimeToSystemTime(&estimated, &utc_time)) {
+        return std::nullopt;
+    }
+
+    return NetworkUtcTime{utc_time.wYear,
+                          utc_time.wMonth,
+                          utc_time.wDay,
+                          utc_time.wDayOfWeek,
+                          utc_time.wHour,
+                          utc_time.wMinute,
+                          utc_time.wSecond};
 }
 
 }  // namespace stock_taskbar_monitor
