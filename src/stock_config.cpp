@@ -458,7 +458,8 @@ AppConfig LoadOrCreateConfig() {
             Utf8ToWide(ReadStringValue(*settings, "active_group").value_or(""));
         if (auto count = ReadDoubleValue(*settings, "taskbar_symbol_count")) {
             const unsigned int requested = static_cast<unsigned int>(*count);
-            if (requested == 2 || requested == 4 || requested == 6 || requested == 8) {
+            if (requested == 2 || requested == 4 || requested == 6 || requested == 8 ||
+                requested == 10) {
                 config.taskbar_symbol_count = requested;
             }
         }

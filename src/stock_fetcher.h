@@ -24,6 +24,7 @@ struct NetworkUtcTime {
 };
 
 std::optional<PriceQuote> FetchRealtimePrice(const StockTarget& target, const AppConfig& config);
+std::optional<PriceQuote> ParseSinaResponse(const std::string& body, const StockTarget& target);
 std::optional<NetworkUtcTime> GetEstimatedNetworkUtcTime();
 
 }  // namespace stock_taskbar_monitor

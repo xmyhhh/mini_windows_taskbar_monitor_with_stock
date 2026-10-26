@@ -82,6 +82,7 @@ constexpr UINT kStockSortLosersCommandId = 1025;
 constexpr UINT kLanguageEnglishCommandId = 1026;
 constexpr UINT kLanguageChineseCommandId = 1027;
 constexpr UINT kOpenStockConfigDialogCommandId = 1028;
+constexpr UINT kStockSymbols10CommandId = 1029;
 constexpr UINT kHelpUrlEditId = 7001;
 constexpr UINT kHelpBodyEditId = 7002;
 constexpr UINT kHelpOpenProjectButtonId = 7003;
@@ -923,7 +924,6 @@ private:
         }
 
         embedder_.Detach(widget_window_);
-        embedder_.SetTargetMonitorIndex(app_config_.taskbar_monitor_index);
         if (!embedder_.Attach(widget_window_)) {
             if (widget_window_ != nullptr && IsWindow(widget_window_)) {
                 DestroyWindow(widget_window_);
@@ -944,6 +944,12 @@ private:
         }
         ShowWindow(widget_window_, SW_SHOWNOACTIVATE);
         RequestWidgetRedraw();
+    }
+
+    void ScheduleTaskbarReattach() {
+        HideHoverPopup();
+        embedder_.Detach(widget_window_);
+        SetTimer(controller_window_, kReattachTimerId, kReattachDelayMs, nullptr);
     }
 
     std::pair<std::wstring, std::wstring> BuildReservedStockTaskbarLines() const {
@@ -3817,7 +3823,7 @@ private:
     void ShowCustomHelpDialog(const std::wstring& body) {
         HelpDialogState state;
         state.owner = controller_window_;
-        state.title = L"Minimal Taskbar Monitor V0.3";
+        state.title = L"Minimal Taskbar Monitor V0.7";
         state.project_url = kProjectUrl;
         state.body = body;
         state.project_label = Text(L"Project URL", L"项目地址");
@@ -4113,10 +4119,6 @@ private:
             return true;
         }
 
-        if (app_config_.taskbar_monitor_index == monitor_index) {
-            return true;
-        }
-
         const unsigned int previous_index = app_config_.taskbar_monitor_index;
         app_config_.taskbar_monitor_index = monitor_index;
         if (!SaveConfig()) {
@@ -4128,10 +4130,14 @@ private:
             return true;
         }
 
+        embedder_.Detach(widget_window_);
+        embedder_.SetTargetMonitorIndex(monitor_index);
         ReattachWidget(true);
         if (!embedder_.IsAttached()) {
             app_config_.taskbar_monitor_index = previous_index;
             SaveConfig();
+            embedder_.Detach(widget_window_);
+            embedder_.SetTargetMonitorIndex(previous_index);
             ReattachWidget(true);
             MessageBoxW(controller_window_,
                         Text(L"Unable to move the widget to the selected display.",
@@ -4326,7 +4332,7 @@ private:
             }
             const UINT flags = MF_STRING |
                                (display.has_taskbar ? MF_ENABLED : MF_GRAYED) |
-                               (app_config_.taskbar_monitor_index == display.index ? MF_CHECKED
+                               (embedder_.TargetMonitorIndex() == display.index ? MF_CHECKED
                                                                                    : MF_UNCHECKED);
             AppendMenuW(monitor_menu,
                         flags,
@@ -4360,6 +4366,11 @@ private:
                         (stock_config_.taskbar_symbol_count == 8 ? MF_CHECKED : MF_UNCHECKED),
                     kStockSymbols8CommandId,
                     Text(L"8 symbols", L"8 个股票"));
+        AppendMenuW(stock_symbol_count_menu,
+                    MF_STRING |
+                        (stock_config_.taskbar_symbol_count == 10 ? MF_CHECKED : MF_UNCHECKED),
+                    kStockSymbols10CommandId,
+                    Text(L"10 symbols", L"10 个股票"));
 
         AppendMenuW(stock_sort_menu,
                     MF_STRING |
@@ -4530,6 +4541,10 @@ private:
         }
         if (command == kStockSymbols8CommandId) {
             SetStockTaskbarSymbolCount(8);
+            return;
+        }
+        if (command == kStockSymbols10CommandId) {
+            SetStockTaskbarSymbolCount(10);
             return;
         }
         if (command == kStockSortConfigCommandId) {
@@ -4787,11 +4802,9 @@ private:
         }
 
         if (message == app->taskbar_created_message_) {
-            app->HideHoverPopup();
-            app->embedder_.Detach(app->widget_window_);
             app->tray_icon_added_ = false;
             app->FlushDeferredStockConfigSave();
-            SetTimer(window_handle, kReattachTimerId, kReattachDelayMs, nullptr);
+            app->ScheduleTaskbarReattach();
             return 0;
         }
 
@@ -4827,7 +4840,7 @@ private:
             if (w_param == kReattachTimerId) {
                 KillTimer(window_handle, kReattachTimerId);
                 app->EnsureTrayIcon();
-                app->ReattachWidget();
+                app->ReattachWidget(true);
                 return 0;
             }
             if (w_param == kHoverHideTimerId) {
@@ -4846,8 +4859,16 @@ private:
                 return 0;
             }
             break;
-        case WM_THEMECHANGED:
+        case WM_DISPLAYCHANGE:
+            app->ScheduleTaskbarReattach();
+            return 0;
         case WM_SETTINGCHANGE:
+            if (w_param == SPI_SETWORKAREA) {
+                app->ScheduleTaskbarReattach();
+                return 0;
+            }
+            [[fallthrough]];
+        case WM_THEMECHANGED:
             app->RefreshFontAndSize();
             if (app->widget_window_ != nullptr && IsWindow(app->widget_window_)) {
                 app->RequestWidgetRedraw();

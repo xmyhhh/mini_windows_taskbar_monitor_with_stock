@@ -1,4 +1,4 @@
-# stock_taskbar_monitor V0.3
+# stock_taskbar_monitor V0.7
 
 一个基于 `minimal_taskbar_monitor` 任务栏嵌入逻辑的 Windows 任务栏监视器。
 
@@ -18,7 +18,8 @@
 - 股票可按配置顺序、当日涨幅、当日跌幅排序
 - 支持多个股票分组 / 多个自选列表
 - 股票模式下，任务栏控件支持滚轮快速切换自选列表，股票悬浮窗顶部支持临时 tab 切换
-- 任务栏股票显示数量可选 2 / 4 / 6 / 8
+- 任务栏股票显示数量可选 2 / 4 / 6 / 8 / 10
+- 显示器连接、断开或任务栏重建后自动恢复嵌入；目标显示器不可用时临时回退主屏
 - 默认英文界面，可在菜单切换中文
 - 托盘图标、开机启动、图标嵌入
 
@@ -55,6 +56,14 @@ build/Release/stock_taskbar_monitor.exe
 
 或者 IDE 自己设置的构建目录。
 
+构建后可运行回归测试：
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+测试覆盖竞价报价与正常交易的切换、显示数量配置保存，以及模拟显示器断开、重连和任务栏重建后的恢复。
+
 ## 使用
 
 运行 `stock_taskbar_monitor.exe` 后，控件会嵌入任务栏。
@@ -89,7 +98,7 @@ build/Release/stock_taskbar_monitor.exe
 
 - `Show stock monitor`：切换到股票模式
 - `Reload Stock Config`：重载 `stocks_config.json`
-- `Taskbar Symbols`：任务栏显示股票数量，2 / 4 / 6 / 8
+- `Taskbar Symbols`：任务栏显示股票数量，2 / 4 / 6 / 8 / 10
 - `Sort`：按配置顺序、当日涨幅、当日跌幅排序
 
 股票模式下，鼠标悬停在任务栏控件上时，滚轮可以在不同自选列表之间快速切换；股票悬浮窗顶部提供 tab 临时切换分组，不会改变任务栏当前列表。
@@ -168,7 +177,7 @@ stocks_config.json
 - `alpaca_secret_key`：Alpaca Secret Key
 - `alpaca_feed`：默认 Alpaca feed，免费账户通常用 `iex`
 - `popup_activation_mode`：弹窗模式，`hover` 或 `click`
-- `taskbar_symbol_count`：任务栏股票数量，只支持 `2`、`4`、`6`、`8`
+- `taskbar_symbol_count`：任务栏股票数量，只支持 `2`、`4`、`6`、`8`、`10`
 - `sort_mode`：股票排序方式，`config`、`top_gainers`、`top_losers`
 - `active_group`：当前启用的自选列表名称
 
@@ -231,6 +240,7 @@ stocks_config.json
 - `market` 写 `hk`
 - `code` 写 5 位港股代码
 - 数据源是新浪港股行情
+- 开盘及收盘竞价期间优先显示接口提供的竞价报价；没有有效报价时回退最新成交价或昨收价
 - 如果要显示 ADR 风格美元价格，可以设置 `show_usd: true`
 - `adr_factor` 是 ADR 折算倍数，例如 BABA 港股和美股 ADR 常用 `8`
 
@@ -252,6 +262,7 @@ stocks_config.json
 - `6` 开头自动走上交所 `sh`
 - `0` / `3` 等常见前缀自动走深交所 `sz`
 - 数据源是新浪 A 股行情
+- 开盘及收盘集合竞价期间优先显示接口提供的竞价报价，并据此计算涨跌幅
 
 ## 美股配置
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cwchar>
 #include <cwctype>
 #include <cstdlib>
@@ -217,11 +218,47 @@ std::vector<std::string> SplitCsv(const std::string& value) {
 std::optional<double> ParseDouble(const std::string& value) {
     char* end = nullptr;
     const double parsed = std::strtod(value.c_str(), &end);
-    if (end == value.c_str()) {
+    if (end == value.c_str() || !std::isfinite(parsed)) {
         return std::nullopt;
     }
     return parsed;
 }
+
+std::optional<double> ReadPositivePrice(const std::vector<std::string>& fields, size_t index) {
+    if (index >= fields.size()) {
+        return std::nullopt;
+    }
+    const auto value = ParseDouble(fields[index]);
+    return value && *value > 0.0 ? value : std::nullopt;
+}
+
+std::optional<int> ParseQuoteMinute(const std::string& time) {
+    if (time.size() < 5 || time[2] != ':') {
+        return std::nullopt;
+    }
+    for (size_t index : {0, 1, 3, 4}) {
+        if (time[index] < '0' || time[index] > '9') {
+            return std::nullopt;
+        }
+    }
+    const int hour = (time[0] - '0') * 10 + time[1] - '0';
+    const int minute = (time[3] - '0') * 10 + time[4] - '0';
+    if (hour > 23 || minute > 59) {
+        return std::nullopt;
+    }
+    return hour * 60 + minute;
+}
+
+bool IsSinaAuctionMinute(bool cn_market, int minute) {
+    if (cn_market) {
+        return (minute >= 9 * 60 + 15 && minute < 9 * 60 + 25) ||
+               (minute >= 14 * 60 + 57 && minute < 15 * 60);
+    }
+    return (minute >= 9 * 60 && minute < 9 * 60 + 20) ||
+           (minute >= 16 * 60 + 1 && minute < 16 * 60 + 10);
+}
+
+}  // namespace
 
 std::optional<PriceQuote> ParseSinaResponse(const std::string& body, const StockTarget& target) {
     const size_t first_quote = body.find('"');
@@ -234,30 +271,47 @@ std::optional<PriceQuote> ParseSinaResponse(const std::string& body, const Stock
     const std::vector<std::string> fields =
         SplitCsv(body.substr(first_quote + 1, second_quote - first_quote - 1));
     const std::wstring market = ToLower(target.market);
-    const size_t price_index = market == L"cn" ? 3 : 6;
+    const bool cn_market = market == L"cn";
+    const size_t price_index = cn_market ? 3 : 6;
     if (fields.size() <= price_index) {
         return std::nullopt;
     }
 
-    auto price = ParseDouble(fields[price_index]);
-    if (!price || *price <= 0.0) {
+    const auto previous_close = ReadPositivePrice(fields, cn_market ? 2 : 3);
+    auto price = ReadPositivePrice(fields, price_index);
+    const size_t time_index = cn_market ? 31 : 18;
+    const auto minute = fields.size() > time_index ? ParseQuoteMinute(fields[time_index])
+                                                  : std::nullopt;
+    if (minute && IsSinaAuctionMinute(cn_market, *minute)) {
+        // Sina publishes the indicative auction price in the best bid/ask fields.
+        // Select by the quote's own time so a delayed response keeps its market phase.
+        auto auction_price = ReadPositivePrice(fields, cn_market ? 6 : 9);
+        if (!auction_price) {
+            auction_price = ReadPositivePrice(fields, cn_market ? 7 : 10);
+        }
+        if (auction_price) {
+            price = auction_price;
+        }
+    }
+    if (!price) {
+        price = previous_close;
+    }
+    if (!price) {
         return std::nullopt;
     }
 
     PriceQuote quote;
     quote.name = fields.empty() ? target.symbol : AnsiToWide(fields[0]);
     quote.price = *price;
-    if (market == L"cn") {
-        if (fields.size() > 2) {
-            if (auto previous_close = ParseDouble(fields[2]); previous_close && *previous_close > 0.0) {
-                quote.change_percent = ((*price - *previous_close) / *previous_close) * 100.0;
-            }
-        }
-    } else if (fields.size() > 8) {
+    if (previous_close) {
+        quote.change_percent = ((*price - *previous_close) / *previous_close) * 100.0;
+    } else if (!cn_market && fields.size() > 8) {
         quote.change_percent = ParseDouble(fields[8]);
     }
     return quote;
 }
+
+namespace {
 
 std::optional<double> ReadJsonNumber(const std::string& body, const std::string& key) {
     const std::string quoted_key = "\"" + key + "\"";

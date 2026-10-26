@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(stock_taskbar_monitor LANGUAGES CXX)
+project(stock_taskbar_monitor VERSION 0.7.0 LANGUAGES CXX)
 
 find_program(POWERSHELL_EXECUTABLE NAMES powershell pwsh REQUIRED)
 
@@ -77,4 +77,29 @@ if(MSVC)
     target_link_options(stock_taskbar_monitor PRIVATE
         $<$<CONFIG:Release>:/OPT:REF /OPT:ICF /INCREMENTAL:NO>
     )
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(stock_regression_tests
+        tests/stock_regression_tests.cpp
+        src/stock_fetcher.cpp
+        src/stock_config.cpp
+    )
+    add_executable(taskbar_embedder_tests tests/taskbar_embedder_tests.cpp)
+    foreach(test_target IN ITEMS stock_regression_tests taskbar_embedder_tests)
+        target_compile_features(${test_target} PRIVATE cxx_std_20)
+        target_compile_options(${test_target} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/EHsc>)
+        target_compile_definitions(${test_target} PRIVATE
+            UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
+            WINVER=0x0A00 _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000000
+        )
+        set_target_properties(${test_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
+        )
+    endforeach()
+    target_link_libraries(stock_regression_tests PRIVATE winhttp)
+    target_link_libraries(taskbar_embedder_tests PRIVATE shell32)
+    add_test(NAME stock_quotes_and_config COMMAND stock_regression_tests)
+    add_test(NAME taskbar_display_recovery COMMAND taskbar_embedder_tests)
 endif()

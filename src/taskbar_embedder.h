@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <string>
 #include <vector>
 
 namespace minimal_taskbar_monitor {
@@ -36,10 +37,10 @@ private:
     };
 
     bool ResolveHandles();
-    bool ResolveTaskbarForTargetMonitor();
+    HWND ResolveTaskbarForTargetMonitor() const;
     bool ResolveClassicHandles();
     bool ResolveWin11Handles();
-    bool FindTaskbarForMonitor(HMONITOR monitor);
+    HWND FindTaskbarForMonitor(HMONITOR monitor) const;
     bool IsPrimaryTaskbar() const;
     bool LayoutClassic(HWND widget_window, const SIZE& desired_size, UINT taskbar_edge);
     bool LayoutNearTray(HWND widget_window, const SIZE& desired_size);
@@ -49,6 +50,7 @@ private:
 
     Mode mode_{Mode::kNone};
     unsigned int target_monitor_index_{0};
+    std::wstring target_monitor_device_name_;
     HWND taskbar_window_{nullptr};
     HWND parent_window_{nullptr};
     HWND task_list_window_{nullptr};
