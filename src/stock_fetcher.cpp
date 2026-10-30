@@ -4,12 +4,14 @@
 #include <winhttp.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cwchar>
 #include <cwctype>
 #include <cstdlib>
 #include <optional>
+#include <mutex>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <vector>
@@ -17,8 +19,9 @@
 namespace stock_taskbar_monitor {
 namespace {
 
-std::atomic<unsigned long long> g_network_utc_file_time{0};
-std::atomic<unsigned long long> g_network_utc_tick_ms{0};
+std::mutex g_network_time_mutex;
+unsigned long long g_network_utc_file_time{0};
+unsigned long long g_network_utc_tick_ms{0};
 
 std::wstring ToLower(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
@@ -126,29 +129,40 @@ void RememberNetworkDateHeader(HINTERNET request) {
     ULARGE_INTEGER combined{};
     combined.LowPart = file_time.dwLowDateTime;
     combined.HighPart = file_time.dwHighDateTime;
-    g_network_utc_file_time.store(combined.QuadPart, std::memory_order_relaxed);
-    g_network_utc_tick_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    std::lock_guard lock(g_network_time_mutex);
+    g_network_utc_file_time = combined.QuadPart;
+    g_network_utc_tick_ms = GetTickCount64();
 }
+
+struct HttpSession {
+    HINTERNET handle{WinHttpOpen(L"stock_taskbar_monitor/1.0",
+                                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
+    HttpSession() {
+        if (handle) {
+            WinHttpSetTimeouts(handle, 1500, 2000, 2500, 2500);
+            DWORD retries = 1;
+            WinHttpSetOption(handle, WINHTTP_OPTION_CONNECT_RETRIES, &retries, sizeof(retries));
+        }
+    }
+    ~HttpSession() { if (handle) WinHttpCloseHandle(handle); }
+};
 
 std::optional<std::string> HttpGet(const std::wstring& host,
                                    const std::wstring& path,
                                    bool https,
                                    const std::wstring& headers) {
-    HINTERNET session = WinHttpOpen(L"stock_taskbar_monitor/1.0",
-                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME,
-                                    WINHTTP_NO_PROXY_BYPASS,
-                                    0);
+    // Reuse connection pooling/TLS state on each sampler thread.
+    thread_local HttpSession http_session;
+    HINTERNET session = http_session.handle;
     if (session == nullptr) {
         return std::nullopt;
     }
 
-    WinHttpSetTimeouts(session, 3000, 3000, 5000, 5000);
     HINTERNET connect = WinHttpConnect(session, host.c_str(), https ? INTERNET_DEFAULT_HTTPS_PORT
                                                                     : INTERNET_DEFAULT_HTTP_PORT,
                                        0);
     if (connect == nullptr) {
-        WinHttpCloseHandle(session);
         return std::nullopt;
     }
 
@@ -158,10 +172,13 @@ std::optional<std::string> HttpGet(const std::wstring& host,
                                            https ? WINHTTP_FLAG_SECURE : 0);
     if (request == nullptr) {
         WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         return std::nullopt;
     }
 
+    const ULONGLONG started = GetTickCount64();
+    DWORD response_timeout = 5000;
+    WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
+                     &response_timeout, sizeof(response_timeout));
     bool ok = WinHttpSendRequest(request,
                                  headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
                                  headers.empty() ? 0 : static_cast<DWORD>(headers.size()),
@@ -173,12 +190,25 @@ std::optional<std::string> HttpGet(const std::wstring& host,
 
     if (ok) {
         RememberNetworkDateHeader(request);
+        DWORD status = 0;
+        DWORD size = sizeof(status);
+        ok = WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                                 WINHTTP_NO_HEADER_INDEX) && status >= 200 && status < 300;
     }
 
     std::string body;
     while (ok) {
         DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) {
+        if (!WinHttpQueryDataAvailable(request, &available)) {
+            ok = false;
+            break;
+        }
+        if (available == 0) {
+            break;
+        }
+        if (GetTickCount64() - started > 10000 || available > 1024 * 1024 - body.size()) {
+            ok = false;
             break;
         }
         const size_t old_size = body.size();
@@ -189,11 +219,13 @@ std::optional<std::string> HttpGet(const std::wstring& host,
             break;
         }
         body.resize(old_size + read);
+        if (read == 0) {
+            break;
+        }
     }
 
     WinHttpCloseHandle(request);
     WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
     if (!ok || body.empty()) {
         return std::nullopt;
     }
@@ -313,6 +345,13 @@ std::optional<PriceQuote> ParseSinaResponse(const std::string& body, const Stock
 
 namespace {
 
+std::wstring SinaSymbol(const StockTarget& target) {
+    if (ToLower(target.market) == L"cn") {
+        return std::wstring(!target.code.empty() && target.code[0] == L'6' ? L"sh" : L"sz") + target.code;
+    }
+    return L"rt_hk" + target.code;
+}
+
 std::optional<double> ReadJsonNumber(const std::string& body, const std::string& key) {
     const std::string quoted_key = "\"" + key + "\"";
     const size_t key_pos = body.find(quoted_key);
@@ -331,7 +370,7 @@ std::optional<double> ReadJsonNumber(const std::string& body, const std::string&
     }
     char* end = nullptr;
     const double parsed = std::strtod(body.c_str() + colon_pos, &end);
-    if (end == body.c_str() + colon_pos) {
+    if (end == body.c_str() + colon_pos || !std::isfinite(parsed)) {
         return std::nullopt;
     }
     return parsed;
@@ -369,8 +408,10 @@ std::optional<std::string> ExtractJsonObject(const std::string& body, const std:
     if (key_pos == std::string::npos) {
         return std::nullopt;
     }
-    size_t open_pos = body.find('{', key_pos + quoted_key.size());
-    if (open_pos == std::string::npos) {
+    size_t colon = body.find(':', key_pos + quoted_key.size());
+    if (colon == std::string::npos) return std::nullopt;
+    size_t open_pos = body.find_first_not_of(" \t\r\n", colon + 1);
+    if (open_pos == std::string::npos || body[open_pos] != '{') {
         return std::nullopt;
     }
 
@@ -409,7 +450,7 @@ std::optional<PriceQuote> ParseAlpacaSnapshot(const std::string& body, const Sto
     const std::optional<std::string> previous_daily_bar = ExtractJsonObject(body, "prevDailyBar");
 
     auto price = latest_trade ? ReadJsonNumber(*latest_trade, "p") : std::nullopt;
-    if (!price && daily_bar) {
+    if ((!price || *price <= 0.0) && daily_bar) {
         price = ReadJsonNumber(*daily_bar, "c");
     }
     if (!price || *price <= 0.0) {
@@ -483,11 +524,111 @@ std::optional<PriceQuote> FetchRealtimePrice(const StockTarget& target, const Ap
     return FetchSinaPrice(target);
 }
 
+std::vector<std::optional<PriceQuote>> ParseSinaBatchResponse(
+    const std::string& body, const std::vector<StockTarget>& targets) {
+    std::vector<std::optional<PriceQuote>> quotes;
+    quotes.reserve(targets.size());
+    for (const auto& target : targets) {
+        const std::string key = "var hq_str_" + WideToUtf8(SinaSymbol(target)) + "=";
+        const auto start = body.find(key);
+        const auto end = start == std::string::npos ? start : body.find(';', start);
+        quotes.push_back(start == std::string::npos ? std::nullopt :
+            ParseSinaResponse(body.substr(start, end == std::string::npos ? end : end - start), target));
+    }
+    return quotes;
+}
+
+std::vector<std::optional<PriceQuote>> ParseAlpacaBatchResponse(
+    const std::string& body, const std::vector<StockTarget>& targets) {
+    std::vector<std::optional<PriceQuote>> quotes;
+    quotes.reserve(targets.size());
+    for (const auto& target : targets) {
+        auto symbol = WideToUtf8(target.code);
+        std::transform(symbol.begin(), symbol.end(), symbol.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+        const auto snapshot = ExtractJsonObject(body, symbol);
+        quotes.push_back(snapshot ? ParseAlpacaSnapshot(*snapshot, target) : std::nullopt);
+    }
+    return quotes;
+}
+
+std::wstring EncodeQueryValue(const std::wstring& value) {
+    constexpr wchar_t hex[] = L"0123456789ABCDEF";
+    std::wstring result;
+    for (unsigned char ch : WideToUtf8(value)) {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            result += static_cast<wchar_t>(ch);
+        } else {
+            result += L'%';
+            result += hex[ch >> 4];
+            result += hex[ch & 15];
+        }
+    }
+    return result;
+}
+
+std::vector<std::optional<PriceQuote>> FetchRealtimePrices(
+    const std::vector<StockTarget>& targets, const AppConfig& config,
+    const std::function<bool()>& cancelled) {
+    std::vector<std::optional<PriceQuote>> quotes(targets.size());
+    std::vector<size_t> sina_indices;
+    std::map<std::wstring, std::vector<size_t>> alpaca_indices;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (ToLower(targets[i].market) != L"us" && ToLower(targets[i].source) != L"alpaca") {
+            sina_indices.push_back(i);
+        } else {
+            const auto& feed = targets[i].alpaca_feed.empty() ? config.alpaca_feed : targets[i].alpaca_feed;
+            alpaca_indices[feed].push_back(i);
+        }
+    }
+    // Sina accepts a comma-separated watchlist. Bound the URL size for large lists.
+    constexpr size_t batch_size = 50;
+    for (size_t begin = 0; begin < sina_indices.size() && !cancelled(); begin += batch_size) {
+        std::vector<StockTarget> batch;
+        std::wstring path = L"/list=";
+        const size_t end = std::min(begin + batch_size, sina_indices.size());
+        for (size_t i = begin; i < end; ++i) {
+            batch.push_back(targets[sina_indices[i]]);
+            if (i != begin) path += L",";
+            path += SinaSymbol(batch.back());
+        }
+        const auto body = HttpGet(L"hq.sinajs.cn", path, true,
+                                 L"Referer: https://finance.sina.com.cn/\r\n");
+        if (body && !cancelled()) {
+            const auto batch_quotes = ParseSinaBatchResponse(*body, batch);
+            for (size_t i = begin; i < end; ++i) quotes[sina_indices[i]] = batch_quotes[i - begin];
+        }
+    }
+    if (config.alpaca_key_id.empty() || config.alpaca_secret_key.empty()) return quotes;
+    const auto endpoint = ParseHttpEndpoint(config.alpaca_endpoint, L"data.alpaca.markets");
+    const std::wstring headers = L"APCA-API-KEY-ID: " + config.alpaca_key_id + L"\r\n" +
+                                 L"APCA-API-SECRET-KEY: " + config.alpaca_secret_key + L"\r\n";
+    for (const auto& [feed, indices] : alpaca_indices) {
+        for (size_t begin = 0; begin < indices.size() && !cancelled(); begin += batch_size) {
+            const size_t end = std::min(begin + batch_size, indices.size());
+            std::vector<StockTarget> batch;
+            std::wstring path = endpoint.path_prefix + L"/v2/stocks/snapshots?symbols=";
+            for (size_t i = begin; i < end; ++i) {
+                batch.push_back(targets[indices[i]]);
+                if (i != begin) path += L",";
+                path += EncodeQueryValue(batch.back().code);
+            }
+            path += L"&feed=" + EncodeQueryValue(feed);
+            const auto body = HttpGet(endpoint.host, path, endpoint.https, headers);
+            if (body && !cancelled()) {
+                const auto batch_quotes = ParseAlpacaBatchResponse(*body, batch);
+                for (size_t i = begin; i < end; ++i) quotes[indices[i]] = batch_quotes[i - begin];
+            }
+        }
+    }
+    return quotes;
+}
+
 std::optional<NetworkUtcTime> GetEstimatedNetworkUtcTime() {
-    const unsigned long long file_time =
-        g_network_utc_file_time.load(std::memory_order_relaxed);
-    const unsigned long long tick_ms =
-        g_network_utc_tick_ms.load(std::memory_order_relaxed);
+    std::lock_guard lock(g_network_time_mutex);
+    const unsigned long long file_time = g_network_utc_file_time;
+    const unsigned long long tick_ms = g_network_utc_tick_ms;
     if (file_time == 0 || tick_ms == 0) {
         return std::nullopt;
     }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(stock_taskbar_monitor VERSION 0.7.0 LANGUAGES CXX)
+project(stock_taskbar_monitor VERSION 0.8.0 LANGUAGES CXX)
 
 find_program(POWERSHELL_EXECUTABLE NAMES powershell pwsh REQUIRED)
 
@@ -87,7 +87,18 @@ if(BUILD_TESTING)
         src/stock_config.cpp
     )
     add_executable(taskbar_embedder_tests tests/taskbar_embedder_tests.cpp)
-    foreach(test_target IN ITEMS stock_regression_tests taskbar_embedder_tests)
+    add_executable(background_worker_tests tests/background_worker_tests.cpp)
+    add_executable(ui_responsiveness_tests
+        tests/ui_responsiveness_tests.cpp
+        src/app_config.cpp
+        src/stock_config.cpp
+        src/stock_config_dialog.cpp
+        src/stock_fetcher.cpp
+        src/process_monitor.cpp
+        src/system_metrics.cpp
+        src/taskbar_embedder.cpp
+    )
+    foreach(test_target IN ITEMS stock_regression_tests taskbar_embedder_tests background_worker_tests ui_responsiveness_tests)
         target_compile_features(${test_target} PRIVATE cxx_std_20)
         target_compile_options(${test_target} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/EHsc>)
         target_compile_definitions(${test_target} PRIVATE
@@ -100,6 +111,10 @@ if(BUILD_TESTING)
     endforeach()
     target_link_libraries(stock_regression_tests PRIVATE winhttp)
     target_link_libraries(taskbar_embedder_tests PRIVATE shell32)
+    target_link_libraries(ui_responsiveness_tests PRIVATE
+        pdh iphlpapi psapi advapi32 shell32 winhttp gdiplus ole32)
     add_test(NAME stock_quotes_and_config COMMAND stock_regression_tests)
     add_test(NAME taskbar_display_recovery COMMAND taskbar_embedder_tests)
+    add_test(NAME background_worker_responsiveness COMMAND background_worker_tests)
+    add_test(NAME stock_ui_responsiveness COMMAND ui_responsiveness_tests)
 endif()
