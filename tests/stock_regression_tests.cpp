@@ -117,11 +117,46 @@ void TestConfig() {
     std::cout << "Config save/load: 2/4/6/8/10 and invalid-count fallback passed\n";
 }
 
+void TestBatchedQuotes() {
+    using namespace stock_taskbar_monitor;
+    StockTarget hk;
+    hk.code = L"00700";
+    StockTarget cn;
+    cn.market = L"cn";
+    cn.code = L"600000";
+    StockTarget missing = hk;
+    missing.code = L"09988";
+    auto body_for = [](std::string body, const std::string& symbol) {
+        body.replace(body.find("test"), 4, symbol);
+        return body;
+    };
+    const auto body = body_for(SinaBody(true, "10:00:00", "107", "0", "0"), "sh600000") +
+                      body_for(SinaBody(false, "10:00:00", "103", "0", "0"), "rt_hk00700");
+    const auto quotes = ParseSinaBatchResponse(body, {hk, missing, cn, hk});
+    Require(quotes.size() == 4 && quotes[0] && quotes[0]->price == 103 && !quotes[1] &&
+            quotes[2] && quotes[2]->price == 107 && quotes[3] && quotes[3]->price == 103,
+            "Batch responses must match symbols, not response order; missing symbols stay empty");
+
+    StockTarget a, b, c, d;
+    a.code = L"aapl"; b.code = L"MSFT"; c.code = L"MISSING"; d.code = L"INVALID";
+    const auto alpaca = ParseAlpacaBatchResponse(
+        R"({"MSFT":{"latestTrade":null,"dailyBar":{"c":210},"prevDailyBar":{"c":200}},
+            "AAPL":{"latestTrade":{"p":105},"prevDailyBar":{"c":100}},
+            "MISSING":null,"INVALID":{"latestTrade":{"p":1e999}}})", {a, b, c, d});
+    Require(alpaca.size() == 4 && alpaca[0] && alpaca[0]->price == 105 &&
+            alpaca[1] && alpaca[1]->price == 210 && !alpaca[2] && !alpaca[3],
+            "Alpaca batch: reorder, lowercase symbol, null snapshot and nonfinite prices");
+    Require(alpaca[1]->change_percent && std::abs(*alpaca[1]->change_percent - 5.0) < 1e-9,
+            "Missing trade must use its own daily bar, not another JSON object");
+    std::cout << "Batched quotes: symbol mapping, missing/null data and fallback passed\n";
+}
+
 }  // namespace
 
 int main() {
     try {
         TestQuotes();
+        TestBatchedQuotes();
         TestConfig();
         return 0;
     } catch (const std::exception& error) {
